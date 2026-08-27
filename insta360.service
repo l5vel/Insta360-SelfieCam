@@ -1,0 +1,18 @@
+[Unit]
+Description=Insta360 SelfieCam Uvicorn Application
+After=network.target
+
+[Service]
+Type=simple
+User=base3
+Group=base3
+WorkingDirectory=/home/base3/Insta360-SelfieCam
+Environment="GMAIL_APP_PASSWORD=olearyd74@gmail.com"
+ExecStart=/home/base3/Insta360-SelfieCam/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 10
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

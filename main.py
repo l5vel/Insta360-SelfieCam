@@ -1,84 +1,156 @@
+import asyncio
 import os
-import shutil
+import re
 import smtplib
 import subprocess
 import time
 import uuid
-import sys
-import threading
-import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from email.message import EmailMessage
 from pathlib import Path
+from typing import Optional, Tuple
 
-import cv2
-import requests
-import numpy as np
 import av
+import cv2
+import httpx
+import numpy as np
 import arm_control
 from insta360.rtmp import Client
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-
 # --- CONFIGURATION ---
-CAMERA_SSID = "X5 135VYD.OSC"
-CAMERA_IP = "192.168.42.1"
-WIFI_PROFILE_NAME = "Insta360"
-WIFI_INTERFACE = "wlx9cefd5f64c06"
-ROBOT_IP = "172.16.0.11"
-CAMERA_ID_HEX = [0x31, 0x33, 0x35, 0x56, 0x59, 0x44]
-GMAIL_USERNAME = "test@example.com"
+CAMERA_SSID = os.getenv("CAMERA_SSID", "X5 135VYD.OSC")
+CAMERA_SSID_PATTERN = os.getenv("CAMERA_SSID_PATTERN", r"\.OSC$")
+CAMERA_IP = os.getenv("CAMERA_IP", "192.168.42.1")
+WIFI_PROFILE_NAME = os.getenv("WIFI_PROFILE_NAME", "Insta360")
+WIFI_INTERFACE = os.getenv("WIFI_INTERFACE", "wlx9cefd5f89420")
+CAPTURE_POLL_ATTEMPTS = int(os.getenv("CAPTURE_POLL_ATTEMPTS", "40"))
+CAPTURE_DOWNLOAD_RETRIES = int(os.getenv("CAPTURE_DOWNLOAD_RETRIES", "3"))
+GMAIL_USERNAME = os.getenv("GMAIL_USERNAME", "olearyd74@gmail.com")
+GMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
-# Global lock for video streaming
-stream_lock = threading.Lock()
+STATIC_DIR = Path("static").resolve()
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
-# Get environment variable
-GMAIL_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+# Thread pool for CPU-bound OpenCV operations
+cpu_pool = ThreadPoolExecutor(max_workers=4)
 
-if not GMAIL_PASSWORD:
-    raise KeyError(
-        "Environment variable 'GMAIL_APP_PASSWORD' is not set. "
-        "Please set it in your shell before running this script."
+# --- GLOBAL THREAD-SAFE STATE ---
+class AppState:
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.status: str = "idle"
+        self.message: str = "Waiting to connect..."
+        self.progress: int = 0
+        self.stream_active: bool = False
+        self.codec: Optional[av.CodecContext] = None
+        self.map_x: Optional[np.ndarray] = None
+        self.map_y: Optional[np.ndarray] = None
+
+    async def update(self, status: str, message: str, progress: int):
+        async with self.lock:
+            self.status = status
+            self.message = message
+            self.progress = progress
+        print(f"[{progress}%] {message}")
+
+    async def get_state(self) -> dict:
+        async with self.lock:
+            return {
+                "status": self.status,
+                "message": self.message,
+                "progress": self.progress,
+                "stream_active": self.stream_active,
+            }
+
+state = AppState()
+rtmp_client = Client()
+
+frame_queue_cropped: asyncio.Queue = asyncio.Queue(maxsize=3)
+frame_queue_equirec: asyncio.Queue = asyncio.Queue(maxsize=3)
+
+
+# --- EQUIRECTANGULAR PROJECTION (LUT) ---
+def generate_equirectangular_maps(w: int, h: int, config: Optional[dict] = None) -> Tuple[np.ndarray, np.ndarray]:
+    if config is None:
+        config = {
+            "fov_deg": 194.0,
+            "yaw_offset_deg": 0.0,
+            "cx1_offset": 0.0, "cy1_offset": 0.0,
+            "cx2_offset": 0.0, "cy2_offset": 0.0,
+            "radius_scale": 1.0
+        }
+
+    out_w, out_h = w, w // 2
+    u, v = np.meshgrid(
+        np.linspace(0.0, 1.0, out_w, dtype=np.float32),
+        np.linspace(0.0, 1.0, out_h, dtype=np.float32)
     )
 
-# --- GLOBAL STATUS TRACKER ---
-connection_state = {
-    "status": "idle", # idle, connecting, connected, error
-    "message": "Waiting to connect...",
-    "progress": 0
-}
+    yaw_rad = np.radians(config["yaw_offset_deg"], dtype=np.float32)
+    max_theta = np.radians(config["fov_deg"], dtype=np.float32) / 2.0
 
-def update_status(status: str, message: str, progress: int):
-    """Updates the global state and mirrors it to the terminal."""
-    connection_state["status"] = status
-    connection_state["message"] = message
-    connection_state["progress"] = progress
-    print(f"[{progress}%] {message}")
+    theta = (u - 0.5) * (2.0 * np.pi) + yaw_rad
+    phi = (0.5 - v) * np.pi
+
+    x = np.cos(phi) * np.cos(theta)
+    y = np.cos(phi) * np.sin(theta)
+    z = np.sin(phi)
+
+    lens_radius = (w / 4.0) * config["radius_scale"]
+    cx1, cy1 = (w / 4.0) + config["cx1_offset"], (h / 2.0) + config["cy1_offset"]
+    cx2, cy2 = (3.0 * w / 4.0) + config["cx2_offset"], (h / 2.0) + config["cy2_offset"]
+
+    front_mask = x >= 0
+    fisheye_x = np.zeros_like(u)
+    fisheye_y = np.zeros_like(v)
+
+    # Front Lens
+    theta_f = np.arccos(np.clip(x[front_mask], -1.0, 1.0))
+    r_f = lens_radius * (theta_f / max_theta)
+    alpha_f = np.arctan2(z[front_mask], y[front_mask])
+    fisheye_x[front_mask] = cx1 + r_f * np.cos(alpha_f)
+    fisheye_y[front_mask] = cy1 - r_f * np.sin(alpha_f)
+
+    # Rear Lens
+    theta_r = np.arccos(np.clip(-x[~front_mask], -1.0, 1.0))
+    r_r = lens_radius * (theta_r / max_theta)
+    alpha_r = np.arctan2(z[~front_mask], -y[~front_mask])
+    fisheye_x[~front_mask] = cx2 + r_r * np.cos(alpha_r)
+    fisheye_y[~front_mask] = cy2 - r_r * np.sin(alpha_r)
+
+    return fisheye_x, fisheye_y
 
 
-# Initialize FastAPI
-app = FastAPI()
+def _process_frame_sync(img_matrix: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> Tuple[bytes, bytes]:
+    """CPU-bound task: crops front lens and generates equirectangular remap."""
+    h, w, _ = img_matrix.shape
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 60]
 
-os.makedirs("static", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
+    # 1. Cropped Front Lens
+    lens_w = w // 2
+    front_lens = img_matrix[:, 0:lens_w]
+    cx, cy = lens_w // 2, h // 2
+    crop_w = int(lens_w * 0.60)
+    crop_h = int(crop_w * 0.75)
+    y1, y2 = cy - (crop_h // 2), cy + (crop_h // 2)
+    x1, x2 = cx - (crop_w // 2), cx + (crop_w // 2)
+    _, jpeg_cropped = cv2.imencode('.jpg', front_lens[y1:y2, x1:x2], encode_param)
 
-# --- RTMP STREAM STATE & LOGIC ---
-rtmp_client = Client()
-stream_active = False
-frame_queue = asyncio.Queue(maxsize=5)
-codec = None
+    # 2. Equirectangular Projection
+    equi_frame = cv2.remap(img_matrix, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    _, jpeg_equi = cv2.imencode('.jpg', equi_frame, encode_param)
+
+    return jpeg_cropped.tobytes(), jpeg_equi.tobytes()
+
 
 @rtmp_client.on_video_stream(wait=True)
 async def process_live_frame(**kwargs):
-    """Parses raw H.264 packets, decodes to OpenCV, applies the math crop, and queues JPEGs."""
-    global stream_active, codec
-    if not stream_active or codec is None:
+    if not state.stream_active or state.codec is None:
         return
 
     content = kwargs.get('content') or kwargs.get('data') or kwargs.get('payload') or kwargs.get('buffer')
@@ -86,71 +158,89 @@ async def process_live_frame(**kwargs):
         return
 
     try:
-        packets = codec.parse(content)
-        for packet in packets:
-            frames = codec.decode(packet)
-            for frame in frames:
-                if not stream_active:
-                    return
-                
-                img_matrix = frame.to_ndarray(format='bgr24')
-                
-                # Apply live spatial cropping
-                h, w, _ = img_matrix.shape
-                lens_w = w // 2
-                front_lens = img_matrix[:, 0:lens_w]
-                cx, cy = lens_w // 2, h // 2
-                crop_w = int(lens_w * 0.60)
-                crop_h = int(crop_w * 0.75)
-                y1, y2 = cy - (crop_h // 2), cy + (crop_h // 2)
-                x1, x2 = cx - (crop_w // 2), cx + (crop_w // 2)
+        packets = state.codec.parse(content)
+        loop = asyncio.get_running_loop()
 
-                cropped_frame = front_lens[y1:y2, x1:x2]
-                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 60]
-                ret, jpeg = cv2.imencode('.jpg', cropped_frame, encode_param)
-                if ret:
-                    if frame_queue.full():
-                        try:
-                            frame_queue.get_nowait() # Drop oldest frame to maintain low latency
-                        except asyncio.QueueEmpty:
-                            pass
-                    frame_queue.put_nowait(jpeg.tobytes())
+        for packet in packets:
+            frames = state.codec.decode(packet)
+            for frame in frames:
+                if not state.stream_active:
+                    return
+
+                img_matrix = frame.to_ndarray(format='bgr24')
+                h, w, _ = img_matrix.shape
+
+                # Cache LUT grids
+                if state.map_x is None or state.map_y is None or state.map_x.shape[1] != w:
+                    state.map_x, state.map_y = generate_equirectangular_maps(w, h)
+
+                # Offload OpenCV remap + encoding off the async loop
+                jpeg_crop_bytes, jpeg_equi_bytes = await loop.run_in_executor(
+                    cpu_pool, _process_frame_sync, img_matrix, state.map_x, state.map_y
+                )
+
+                # Push to cropped queue
+                if frame_queue_cropped.full():
+                    try:
+                        frame_queue_cropped.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                await frame_queue_cropped.put(jpeg_crop_bytes)
+
+                # Push to equirectangular queue
+                if frame_queue_equirec.full():
+                    try:
+                        frame_queue_equirec.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                await frame_queue_equirec.put(jpeg_equi_bytes)
+
     except Exception as e:
         print(f"RTMP Decode Error: {e}")
 
-def start_rtmp_stream():
-    global stream_active, codec
-    if stream_active:
-        return
-    # Re-initialize the FFmpeg codec context for a fresh stream
-    codec = av.CodecContext.create('h264', 'r')
+
+def _start_rtmp_sync():
+    state.codec = av.CodecContext.create('h264', 'r')
     rtmp_client.open()
     rtmp_client.start_preview_stream()
-    stream_active = True
 
-def stop_rtmp_stream():
-    global stream_active
-    stream_active = False
+def _stop_rtmp_sync():
     try:
         rtmp_client.close()
     except Exception:
         pass
-    
-    # Flush the frame queue
-    while not frame_queue.empty():
-        try:
-            frame_queue.get_nowait()
-        except asyncio.QueueEmpty:
-            break
 
-async def video_generator():
-    """Consumes the frame queue and yields MJPEG HTTP boundaries."""
-    frame_delay=1.0/15
-    while stream_active:
+
+async def start_rtmp_stream():
+    if state.stream_active:
+        return
+    state.stream_active = True
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _start_rtmp_sync)
+
+
+async def stop_rtmp_stream():
+    state.stream_active = False
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _stop_rtmp_sync)
+
+    for q in (frame_queue_cropped, frame_queue_equirec):
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+
+async def video_generator(queue: asyncio.Queue):
+    frame_delay = 1.0 / 20.0
+    while state.stream_active:
         try:
-            frame_bytes = await asyncio.wait_for(frame_queue.get(), timeout=1.0)
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            frame_bytes = await asyncio.wait_for(queue.get(), timeout=1.0)
+            yield (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n'
+            )
             await asyncio.sleep(frame_delay)
         except asyncio.TimeoutError:
             continue
@@ -158,390 +248,359 @@ async def video_generator():
             break
 
 
-# --- BLUETOOTH WAKE LOGIC ---
+# --- SYSTEM RUNNERS & WIFI LOGIC ---
+async def run_cmd(cmd: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    )
 
-def run_btmgmt_safe(cmd_list, timeout_sec=3):
-    full_cmd = ["sudo", "/usr/bin/timeout", str(timeout_sec), "/usr/bin/btmgmt"] + cmd_list
-    return subprocess.run(full_cmd, capture_output=True, text=True)
-
-def clear_adv_instances():
-    for i in range(1, 4):
-        run_btmgmt_safe(["rm-adv", str(i)], timeout_sec=2)
-
-def wake_camera_pulse(stop_event: threading.Event):
-    manuf_data = [
-        0x4C, 0x00, 0x02, 0x15, 0x09, 0x4F, 0x52, 0x42, 
-        0x49, 0x54, 0x09, 0xFF, 0x0F, 0x00, 
-        *CAMERA_ID_HEX, 
-        0x00, 0x00, 0x00, 0x00, 0xE4, 0x01,
-    ]
-
-    ad_element = [len(manuf_data) + 1, 0xFF] + manuf_data
-    hex_payload = "".join(f"{b:02x}" for b in ad_element)
-
-    update_status("connecting", "Purging orphaned Bluetooth states...", 5)
-    clear_adv_instances()
-
-    for attempt in range(1, 15):
-        if stop_event.is_set():
-            break
-
-        # Progress scales slowly during the BLE phase (10% to 40%)
-        current_progress = min(10 + (attempt * 2), 40)
-        update_status("connecting", f"Transmitting BLE wake pulse {attempt}/14...", current_progress)
-        
-        result = run_btmgmt_safe(["add-adv", "-c", "-p", "-d", hex_payload, "1"], timeout_sec=3)
-        if result.returncode != 0 and result.returncode != 124:
-            print(f"     [!] Pulse warning: {result.stderr.strip()}")
-
-        interrupted = stop_event.wait(1.5)
-        run_btmgmt_safe(["rm-adv", "1"], timeout_sec=2)
-        
-        if interrupted:
-            update_status("connecting", "Camera radio detected! Halting BLE pulses.", 45)
-            break
-            
-        time.sleep(0.2)
-
-# --- NETWORK & CAMERA LOGIC ---
-
-def toggle_camera_radio(state: str):
-    if state == "up":
-        update_status("connecting", "Initializing wake sequence...", 0)
-        # --- BLE wake disabled for now ---
-        # camera_awake_event = threading.Event()
-        # ble_thread = threading.Thread(
-        #     target=wake_camera_pulse,
-        #     args=(camera_awake_event,)
-        # )
-        # ble_thread.start()
-
-        try:
-            update_status("connecting", "Waking up robot Wi-Fi dongle...", 5)
-            subprocess.run(
-                ["nmcli", "device", "disconnect", WIFI_INTERFACE],
-                capture_output=True,
-                timeout=10,
-            )
-            time.sleep(0.5)  # let the interface settle out of its transition
-
-            ssid_found = False
-            for i in range(5):
-                # Progress scales during Wi-Fi scan (45% to 70%)
-                scan_prog = min(45 + 2*i, 65)
-                update_status("connecting", f"Scanning airwaves for {CAMERA_SSID} (Attempt {i+1}/5)...", scan_prog)
-
-                # nmcli rate-limits rescans; if it's deferred the cached list is
-                # stale, so skip this round rather than trust a phantom SSID.
-                rescan = subprocess.run(
-                    ["nmcli", "device", "wifi", "rescan"], capture_output=True, text=True
-                )
-                if rescan.returncode != 0:
-                    print(f"     [!] Rescan deferred: {rescan.stderr.strip()}")
-                    time.sleep(2.0)
-                    continue
-
-                time.sleep(1.5)  # let fresh results populate before reading the list
-                scan_results = subprocess.run(
-                    ["nmcli", "-t", "-f", "SSID", "device", "wifi", "list"],
-                    capture_output=True,
-                    text=True,
-                )
-
-                if CAMERA_SSID in scan_results.stdout:
-                    ssid_found = True
-                    # camera_awake_event.set()  # BLE wake disabled for now
-                    update_status("connecting", "Camera AP found! Securing connection...", 75)
-                    break
-
-                time.sleep(1.0)
-
-            if not ssid_found:
-                update_status("error", "Scan Timeout: Ensure the camera is powered on and broadcasting its Wi-Fi network.", 0)
-                raise Exception("Scan Timeout: Ensure the camera is powered on and broadcasting its Wi-Fi network.")
-
-            cmd = ["nmcli", "--wait", "10", "connection", "up", WIFI_PROFILE_NAME]
-            result = None
-            for attempt in range(2):
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
-                if result.returncode == 0:
-                    break
-                print(f"     [!] Handshake attempt {attempt + 1}/2 failed: {result.stderr.strip()}")
-                time.sleep(1.0)
-
-            if result.returncode != 0:
-                reason = result.stderr.strip() or "unknown nmcli error"
-                update_status("error", f"Wi-Fi Handshake Failed: Try rebooting the camera", 0)
-                raise Exception(f"Wi-Fi handshake failed: Try rebooting the camera")
-
-            update_status("connecting", "Wi-Fi authenticated. Waiting for DHCP lease...", 85)
-            dhcp_settled = False
-
-            for i in range(6):
-                route_check = subprocess.run(
-                    ["ip", "route", "show", "dev", WIFI_INTERFACE],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-
-                if "192.168.42.0" in route_check.stdout:
-                    dhcp_settled = True
-                    update_status("connecting", "DHCP assigned! Subnet routing initialized.", 95)
-                    break
-                time.sleep(0.5)
-
-            if not dhcp_settled:
-                subprocess.run(
-                    ["nmcli", "connection", "down", WIFI_PROFILE_NAME],
-                    capture_output=True,
-                    timeout=10,
-                )
-                update_status("error", "DHCP Timeout.", 0)
-                raise Exception("DHCP Timeout: Connected to Wi-Fi, but failed to obtain a local IP address.")
+def find_camera_ssid(scan_output: str) -> Optional[str]:
+    """Prefer the configured SSID, else the first AP matching CAMERA_SSID_PATTERN."""
+    ssids = [line.strip() for line in scan_output.splitlines() if line.strip()]
+    if CAMERA_SSID in ssids:
+        return CAMERA_SSID
+    for ssid in ssids:
+        if re.search(CAMERA_SSID_PATTERN, ssid, re.IGNORECASE):
+            return ssid
+    return None
 
 
-            update_status("connecting", "Wi-Fi routed. Verifying camera API readiness...", 98)
-            api_ready = False
-            
-            # Ping the camera's API for up to 10 seconds to ensure its web server is awake
-            for _ in range(10):
-                try:
-                    res = requests.get(f"http://{CAMERA_IP}/osc/info", timeout=1)
-                    if res.status_code == 200:
-                        api_ready = True
-                        break
-                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                    pass
-                time.sleep(1.0)
+async def sync_profile_ssid(ssid: str) -> None:
+    """Repoint the pinned profile when the camera advertises a different SSID."""
+    res = await run_cmd(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", WIFI_PROFILE_NAME], timeout=5.0)
+    if res.returncode == 0 and res.stdout.strip() == ssid:
+        return
+    mod = await run_cmd(
+        ["sudo", "-n", "nmcli", "connection", "modify", WIFI_PROFILE_NAME, "802-11-wireless.ssid", ssid],
+        timeout=10.0,
+    )
+    if mod.returncode != 0:
+        print(f"[!] Could not repoint {WIFI_PROFILE_NAME} to {ssid}: {mod.stderr.strip()}")
+    else:
+        print(f"[*] Repointed {WIFI_PROFILE_NAME} to SSID {ssid}")
 
-            if not api_ready:
-                subprocess.run(["nmcli", "connection", "down", WIFI_PROFILE_NAME], capture_output=True)
-                update_status("error", "Camera Wi-Fi connected, but API failed to boot.", 0)
-                raise Exception("Camera Wi-Fi connected, but the internal web server failed to respond.")
 
-            time.sleep(0.5)
-            update_status("connected", "Camera successfully connected and ready.", 100)
-        finally:
-            # --- BLE wake disabled for now ---
-            # camera_awake_event.set()
-            # ble_thread.join(timeout=8)
-            # clear_adv_instances()
-            pass
+async def robust_wifi_connect(interface: str, profile_name: str, ssid: str, max_retries: int = 3) -> bool:
+    for attempt in range(1, max_retries + 1):
+        await state.update("connecting", f"Connecting to AP profile (Attempt {attempt}/{max_retries})...", 60 + (attempt * 5))
+        await run_cmd(["nmcli", "device", "disconnect", interface], timeout=5.0)
+        await asyncio.sleep(0.5)
 
-    elif state == "down":
-        update_status("idle", "Tearing down camera connection...", 0)
-        # clear_adv_instances()  # BLE wake disabled for now
-        subprocess.run(
-            ["nmcli", "connection", "down", WIFI_PROFILE_NAME],
-            capture_output=True,
-            timeout=10,
+        await run_cmd(["nmcli", "device", "wifi", "rescan", "ifname", interface], timeout=6.0)
+        await asyncio.sleep(1.0)
+
+        connect_res = await run_cmd(
+            ["nmcli", "--wait", "12", "connection", "up", profile_name, "ifname", interface],
+            timeout=15.0
         )
-        update_status("idle", "Camera disconnected.", 0)
-        
-def crop_front_lens(image_path: str):
-    img = cv2.imread(image_path)
-    if img is None:
-        raise Exception(f"Could not read image at {image_path} for cropping.")
+        if connect_res.returncode == 0:
+            return True
 
-    h, w, _ = img.shape
-    lens_w = w // 2
-    front_lens = img[:, 0:lens_w]
-    cx, cy = lens_w // 2, h // 2
-    crop_w = int(lens_w * 0.60)
-    crop_h = int(crop_w * 0.75)
-    y1, y2 = cy - (crop_h // 2), cy + (crop_h // 2)
-    x1, x2 = cx - (crop_w // 2), cx + (crop_w // 2)
-    cv2.imwrite(image_path, front_lens[y1:y2, x1:x2])
+        print(f"[!] Handshake attempt {attempt} failed: {connect_res.stderr.strip()}")
 
-
-def send_email_attachment(recipient: str, filepath: str):
-    sender = GMAIL_USERNAME
-    app_password = GMAIL_PASSWORD
-    msg = EmailMessage()
-    msg["Subject"], msg["From"], msg["To"] = "Your Selfie!", sender, recipient
-    msg.set_content("Here is your photo!")
-    try:
-        with open(filepath, "rb") as f:
-            msg.add_attachment(
-                f.read(), maintype="image", subtype="jpeg", filename="selfie.jpg"
+        if attempt == 2:
+            fallback_res = await run_cmd(
+                ["nmcli", "--wait", "12", "device", "wifi", "connect", ssid, "ifname", interface],
+                timeout=15.0
             )
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
-            server.login(sender, app_password)
-            server.send_message(msg)
-    except Exception as e:
-        raise Exception(f"Email failed: {e}")
+            if fallback_res.returncode == 0:
+                return True
 
-# --- API ENDPOINTS ---
+        await asyncio.sleep(1.5)
+
+    return False
+
+
+# --- FASTAPI APP & LIFESPAN ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await stop_rtmp_stream()
+    # Release the arm/base lease on shutdown; nothing else drops it.
+    try:
+        arm_control.arm_release()
+    except Exception as e:
+        print(f"[selfie] arm release on shutdown failed: {e}")
+    cpu_pool.shutdown(wait=False)
+
+app = FastAPI(lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+# --- ENDPOINTS ---
 
 @app.get("/")
 async def serve_frontend():
-    return FileResponse("index.html")
+    index_path = Path("index.html").resolve()
+    if not index_path.is_file():
+        raise HTTPException(status_code=404, detail="index.html not found in project root.")
+    return FileResponse(index_path, media_type="text/html")
+
 
 @app.get("/stream")
-async def stream_feed():
-    """Initializes the RTMP connection and serves the MJPEG feed."""
+async def stream_feed_cropped():
+    """Initializes the RTMP stream and serves the cropped MJPEG feed."""
     try:
-        # Offload the blocking network connection to a thread
-        await asyncio.to_thread(start_rtmp_stream)
+        await start_rtmp_stream()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start live stream: {e}")
-    
-    return StreamingResponse(video_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
+    return StreamingResponse(video_generator(frame_queue_cropped), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/stream/equirec")
+async def stream_feed_equirec():
+    """Initializes the RTMP stream and serves the equirectangular MJPEG feed."""
+    try:
+        await start_rtmp_stream()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start live stream: {e}")
+    return StreamingResponse(video_generator(frame_queue_equirec), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
 @app.get("/status")
 async def get_status():
-    """Non-blocking endpoint so the frontend can poll the connection state."""
-    return connection_state
+    return await state.get_state()
+
 
 @app.post("/connect")
-def connect_camera():
-    try:
-        toggle_camera_radio("up")
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def connect_camera():
+    await state.update("connecting", "Initializing Wi-Fi interface...", 5)
+    await run_cmd(["nmcli", "device", "set", WIFI_INTERFACE, "managed", "yes"], timeout=5.0)
+    await run_cmd(["nmcli", "device", "disconnect", WIFI_INTERFACE], timeout=5.0)
+
+    camera_ssid = None
+    scan_passes = 4
+    for i in range(scan_passes):
+        await state.update("connecting", f"Scanning for camera AP ({i+1}/{scan_passes})...", 10 + i * 12)
+        try:
+            rescan_res = await run_cmd(["nmcli", "device", "wifi", "rescan", "ifname", WIFI_INTERFACE], timeout=15.0)
+            if rescan_res.returncode != 0:
+                print(f"[!] Rescan pass {i+1} failed: {rescan_res.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            print(f"[!] Rescan pass {i+1} timed out after 15s")
+
+        # rescan returns immediately; a full scan takes ~11s to populate
+        await asyncio.sleep(12.0)
+        res = await run_cmd(["nmcli", "-t", "-f", "SSID", "device", "wifi", "list", "ifname", WIFI_INTERFACE])
+        camera_ssid = find_camera_ssid(res.stdout)
+        if camera_ssid:
+            break
+
+    if not camera_ssid:
+        await state.update("error", "SSID not found. Verify camera Wi-Fi is enabled.", 0)
+        raise HTTPException(status_code=504, detail="Camera SSID scan timed out.")
+
+    await sync_profile_ssid(camera_ssid)
+    connected = await robust_wifi_connect(WIFI_INTERFACE, WIFI_PROFILE_NAME, camera_ssid, max_retries=3)
+    if not connected:
+        await state.update("error", "Wi-Fi Handshake failed.", 0)
+        raise HTTPException(status_code=502, detail="Failed to negotiate Wi-Fi connection with camera.")
+
+    # DHCP Verification
+    await state.update("connecting", "Verifying network route...", 80)
+    for _ in range(8):
+        route_check = await run_cmd(["ip", "route", "show", "dev", WIFI_INTERFACE], timeout=3.0)
+        if "192.168.42." in route_check.stdout or CAMERA_IP in route_check.stdout:
+            break
+        await asyncio.sleep(0.5)
+
+    # OSC API Health Check
+    await state.update("connecting", "Polling Camera OSC API...", 90)
+    async with httpx.AsyncClient(timeout=1.5) as client:
+        ready = False
+        for _ in range(10):
+            try:
+                r = await client.get(f"http://{CAMERA_IP}/osc/info")
+                if r.status_code == 200:
+                    ready = True
+                    break
+            except httpx.RequestError:
+                pass
+            await asyncio.sleep(0.5)
+
+    if not ready:
+        await run_cmd(["nmcli", "connection", "down", WIFI_PROFILE_NAME], timeout=5.0)
+        await state.update("error", "Camera connected but HTTP OSC server is unreachable.", 0)
+        raise HTTPException(status_code=502, detail="OSC API unreachable.")
+
+    await state.update("connected", "Camera successfully connected and ready.", 100)
+    return {"status": "success"}
 
 
 @app.post("/position-arm")
-def position_arm():
-    # Move the arm to the selfie pose (follows the trajectory if not already
-    # there). The arm connects on first move, not at import.
+async def position_arm():
+    loop = asyncio.get_running_loop()
     try:
-        arm_control.move_arm_to_selfie()
+        await loop.run_in_executor(None, arm_control.move_arm_to_selfie)
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Arm positioning failed: {e}")
 
 
-def _capture_to_file(unique_image_path):
-    """Drive one camera capture over HTTP and save the result to disk.
-    Raises requests connection errors up to the caller so they can auto-reset."""
-    execute_url = f"http://{CAMERA_IP}/osc/commands/execute"
-    trigger_res = requests.post(
-        execute_url, json={"name": "camera.takePicture"}, timeout=5
-    ).json()
+def _post_process_capture(raw_path: Path, processed_path: Path, logo_path: Path) -> None:
+    img = cv2.imread(str(raw_path))
+    if img is None:
+        raise ValueError("Failed to load captured raw image.")
 
-    if trigger_res.get("state") == "error":
-        raise Exception(
-            "Camera rejected capture command. Make sure it's in Photo mode and then refresh the page"
-        )
+    h, w, _ = img.shape
+    lens_w = w // 2
+    cx, cy = lens_w // 2, h // 2
+    crop_w = int(lens_w * 0.60)
+    crop_h = int(crop_w * 0.75)
+    cropped = img[cy - crop_h // 2 : cy + crop_h // 2, cx - crop_w // 2 : cx + crop_w // 2]
 
-    command_id = trigger_res.get("id")
-    status_url = f"http://{CAMERA_IP}/osc/commands/status"
-    file_url = None
+    border_width = 200
+    canvas = cv2.copyMakeBorder(cropped, 0, border_width, 0, 0, cv2.BORDER_CONSTANT, value=(149, 53, 0))
 
-    for _ in range(10):
-        time.sleep(1)
-        status_res = requests.post(
-            status_url, json={"id": command_id}, timeout=5
-        ).json()
-        if status_res.get("state") == "done":
-            file_url = status_res.get("results", {}).get("fileUrl")
-            break
+    if logo_path.exists():
+        logo = cv2.imread(str(logo_path), cv2.IMREAD_UNCHANGED)
+        if logo is not None and logo.shape[2] == 4:
+            max_h = int(border_width * 0.8)
+            if logo.shape[0] > max_h:
+                scale = max_h / logo.shape[0]
+                logo = cv2.resize(logo, (int(logo.shape[1] * scale), max_h), interpolation=cv2.INTER_AREA)
 
-    if not file_url:
-        raise Exception("Camera timed out while processing image.")
+            l_bgr = logo[:, :, :3]
+            alpha = (logo[:, :, 3].astype(np.float32) / 255.0)[:, :, None]
 
-    img_data = requests.get(file_url, timeout=60).content
+            lh, lw, _ = l_bgr.shape
+            ch, cw, _ = canvas.shape
+            margin = int(border_width * 0.1)
+            y1, y2 = ch - lh - margin, ch - margin
+            x1, x2 = cw - lw - margin, cw - margin
 
-    with open(unique_image_path, "wb") as f:
-        f.write(img_data)
+            roi = canvas[y1:y2, x1:x2].astype(np.float32)
+            blended = (l_bgr.astype(np.float32) * alpha) + (roi * (1.0 - alpha))
+            canvas[y1:y2, x1:x2] = blended.astype(np.uint8)
+
+    cv2.imwrite(str(processed_path), canvas)
+
+
+async def download_capture(client: httpx.AsyncClient, file_url: str) -> bytes:
+    """Fetch the captured image, retrying transient network failures."""
+    last_error: Optional[Exception] = None
+    for attempt in range(1, CAPTURE_DOWNLOAD_RETRIES + 1):
+        try:
+            resp = await client.get(file_url, timeout=90.0)
+            if resp.status_code == 200:
+                return resp.content
+            last_error = httpx.RequestError(f"HTTP {resp.status_code} fetching image")
+        except httpx.RequestError as e:
+            last_error = e
+        print(f"[!] Image download attempt {attempt}/{CAPTURE_DOWNLOAD_RETRIES} failed: {last_error}")
+        await asyncio.sleep(1.5)
+    raise last_error
 
 
 @app.post("/capture")
-def capture_image():
-    # CRITICAL: Stop the RTMP feed to free up network and camera ISP before triggering the capture
-    stop_rtmp_stream()
-    time.sleep(1.0) # Hardware settling delay
+async def capture_image():
+    await stop_rtmp_stream()
+    await asyncio.sleep(0.5)
 
-    unique_image_path = "./static/latest.jpg"
-
-    try:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        stage = "takePicture"
         try:
-            _capture_to_file(unique_image_path)
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-            # Camera HTTP dropped ("Max retries exceeded" / network unreachable).
-            # Auto-reset the connection over the Wi-Fi/HTTP path only — no BLE,
-            # no arm — then retry the capture once.
-            update_status("connecting", "Camera connection lost. Auto-resetting...", 0)
-            toggle_camera_radio("up")
-            _capture_to_file(unique_image_path)
+            resp = await client.post(f"http://{CAMERA_IP}/osc/commands/execute", json={"name": "camera.takePicture"})
+            data = resp.json()
+            if data.get("state") == "error":
+                raise HTTPException(status_code=400, detail="Camera rejected takePicture command.")
 
-    except Exception as e:
-        try:
-            toggle_camera_radio("down")
-        except:
-            pass
-        raise HTTPException(status_code=500, detail=str(e))
+            cmd_id = data["id"]
+            file_url = None
 
-    try:
-        crop_front_lens(unique_image_path)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed during local image processing: {e}"
-        )
+            stage = "status poll"
+            for _ in range(CAPTURE_POLL_ATTEMPTS):
+                await asyncio.sleep(0.5)
+                st_resp = await client.post(f"http://{CAMERA_IP}/osc/commands/status", json={"id": cmd_id})
+                st_data = st_resp.json()
+                if st_data.get("state") == "done":
+                    file_url = st_data.get("results", {}).get("fileUrl")
+                    break
+                if st_data.get("state") == "error":
+                    raise HTTPException(status_code=400, detail="Camera reported an error during capture.")
 
-    return {"status": "success", "lan_path": f"/static/latest.jpg?t={int(time.time())}"}
+            if not file_url:
+                raise HTTPException(status_code=504, detail="Capture timed out on camera storage.")
+
+            stage = "image download"
+            raw_bytes = await download_capture(client, file_url)
+
+        except httpx.RequestError as e:
+            print(f"[!] Capture failed during {stage}: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=502, detail=f"OSC network error during {stage}: {e}")
+
+    file_id = uuid.uuid4().hex[:8]
+    raw_file = STATIC_DIR / f"raw_{file_id}.jpg"
+    final_file = STATIC_DIR / f"selfie_{file_id}.jpg"
+    logo_file = STATIC_DIR / "logo.png"
+
+    raw_file.write_bytes(raw_bytes)
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(cpu_pool, _post_process_capture, raw_file, final_file, logo_file)
+    raw_file.unlink(missing_ok=True)
+
+    return {"status": "success", "file_name": final_file.name, "url": f"/static/{final_file.name}"}
+
 
 @app.post("/email")
-def trigger_email(email: str, image: str):
-    clean_path = image.split("?")[0].lstrip("/")
+async def trigger_email(email: str = Query(...), filename: str = Query(...)):
+    target_path = (STATIC_DIR / Path(filename).name).resolve()
+    if not target_path.is_relative_to(STATIC_DIR) or not target_path.is_file():
+        raise HTTPException(status_code=404, detail="Invalid image file requested.")
 
-    if not os.path.exists(clean_path):
-        raise HTTPException(
-            status_code=404, detail="Requested image file not found on server."
-        )
+    if not GMAIL_PASSWORD:
+        raise HTTPException(status_code=500, detail="Mail credentials not configured.")
 
+    msg = EmailMessage()
+    msg["Subject"] = "Your Robot Selfie!"
+    msg["From"] = GMAIL_USERNAME
+    msg["To"] = email
+    msg.set_content("Here is your photo attached!")
+    msg.add_attachment(target_path.read_bytes(), maintype="image", subtype="jpeg", filename=target_path.name)
+
+    def _send():
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+            server.login(GMAIL_USERNAME, GMAIL_PASSWORD)
+            server.send_message(msg)
+
+    loop = asyncio.get_running_loop()
     try:
-        send_email_attachment(email, clean_path)
-        return {"status": "success"}
+        await loop.run_in_executor(None, _send)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to dispatch email: {e}")
 
-
-def power_off_camera():
-    """Best-effort: there is no direct OSC power-off, so set the standard
-    sleepDelay/offDelay options to make the camera sleep and power itself off
-    shortly after we disconnect. Must run while Wi-Fi is still up. Errors ignored."""
-    try:
-        execute_url = f"http://{CAMERA_IP}/osc/commands/execute"
-        res = requests.post(
-            execute_url,
-            json={"name": "camera.setOptions",
-                  "parameters": {"options": {"sleepDelay": 15, "offDelay": 30}}},
-            timeout=5,
-        ).json()
-        if res.get("state") == "error":
-            print(f"     [!] Camera rejected power-off options: {res.get('error')}")
-    except Exception as e:
-        print(f"     [!] Camera power-off request failed: {e}")
+    return {"status": "success"}
 
 
 @app.post("/disconnect")
-def disconnect_camera(home_arm: bool = False):
-    # CRITICAL: Stop the RTMP feed before issuing network commands to disconnect
-    stop_rtmp_stream()
+async def disconnect_camera(home_arm: bool = False):
+    await stop_rtmp_stream()
 
-    # The arm only returns home on an explicit Disconnect press (home_arm=true).
-    # Automatic teardown — idle timeout, page hidden/closed — tears down the
-    # camera but leaves the arm exactly where it is. If homing fails we still
-    # tear down the camera so the user isn't left connected, but report it.
     arm_error = None
     if home_arm:
+        loop = asyncio.get_running_loop()
         try:
-            arm_control.move_arm_home()
-            arm_control.arm_release()
+            await loop.run_in_executor(None, arm_control.move_arm_home)
+            await loop.run_in_executor(None, arm_control.arm_release)
         except Exception as e:
             arm_error = str(e)
 
-    # Tell the camera to power off (best-effort) while it's still reachable,
-    # then tear down the Wi-Fi link.
-    power_off_camera()
+    # Trigger power off via OSC
     try:
-        toggle_camera_radio("down")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            await client.post(
+                f"http://{CAMERA_IP}/osc/commands/execute",
+                json={"name": "camera.setOptions", "parameters": {"options": {"sleepDelay": 15, "offDelay": 30}}}
+            )
+    except Exception:
+        pass
+
+    await run_cmd(["nmcli", "connection", "down", WIFI_PROFILE_NAME], timeout=5.0)
+    await state.update("idle", "Camera disconnected.", 0)
 
     if arm_error:
-        return {"status": "warning", "message": f"Camera disconnected; arm home/release issue: {arm_error}"}
+        return {"status": "warning", "message": f"Camera disconnected; arm release issue: {arm_error}"}
     return {"status": "success", "message": "Camera disconnected."}

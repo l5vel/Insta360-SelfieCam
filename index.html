@@ -358,6 +358,7 @@
 
 <script>
     let currentImagePath = '';
+    let currentFileName = '';
     let connectionTimeout;
     const IDLE_TIMEOUT_MS = 180000;
 
@@ -507,8 +508,8 @@
         setStatus('captureStatus', 'Moving arm into position...', 'working');
 
         try {
-            //const armRes = await fetch('/position-arm', { method: 'POST' });
-            //if (!armRes.ok) throw new Error(await armRes.text());
+            const armRes = await fetch('/position-arm', { method: 'POST' });
+            if (!armRes.ok) throw new Error(await armRes.text());
 
             setStatus('captureStatus', 'Get Ready! 3...', 'working');
             await runCountdown(3);
@@ -523,7 +524,8 @@
             if (!res.ok) throw new Error(await res.text());
             
             const data = await res.json();
-            currentImagePath = data.lan_path; 
+            currentImagePath = data.url;
+            currentFileName = data.file_name;
             
             document.getElementById('placeholderText').style.display = 'none';
             document.getElementById('resultImage').src = currentImagePath;
@@ -580,7 +582,7 @@
         setStatus('emailStatus', 'Sending...', 'working');
 
         try {
-            const res = await fetch(`/email?email=${encodeURIComponent(email)}&image=${encodeURIComponent(currentImagePath)}`, { method: 'POST' });
+            const res = await fetch(`/email?email=${encodeURIComponent(email)}&filename=${encodeURIComponent(currentFileName)}`, { method: 'POST' });
             if (!res.ok) throw new Error(await res.text());
 
             setStatus('emailStatus', 'Email sent successfully!', 'success');

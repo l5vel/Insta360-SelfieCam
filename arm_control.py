@@ -6,8 +6,8 @@ FastAPI app still starts if the arm is offline.
 
 Motion model:
 - The "are we there yet?" check (`arm_at_pose`) is a *pure read* of the live
-  joint angles via get_servo_angle. It never commands motion.
-- Trajectory following (`arm_follow`) issues one blocking set_servo_angle
+  joint angles via api_get_servo_angle. It never commands motion.
+- Trajectory following (`arm_follow`) issues one blocking api_set_servo_angle
   per waypoint, so every intermediate pose is honored — it is never a single
   direct move to the goal pose.
 - Homing is gated (`_arm_deployed`): `move_arm_home` only commands motion if
@@ -16,14 +16,20 @@ Motion model:
   never driven into motion uncommanded.
 """
 
+import sys
 import time
 import threading
 
-# Use the official open-source UFACTORY SDK
-from xarm.wrapper import XArmAPI
-
 # --- ARM CONFIGURATION ---
-ARM_IP = "172.16.0.11"
+import os
+SBOT_PATH = "/home/base3/sbot_classical" if os.path.exists("/home/base3/sbot_classical") else "/home/l5vel-sbot/SBot/third_party/sbot_classical"
+ARM_IP = "172.16.0.13"
+
+# path_setup registers arm_base_control on sys.path as an import side effect.
+if SBOT_PATH not in sys.path:
+    sys.path.insert(0, SBOT_PATH)
+import path_setup  # noqa: E402,F401
+from arm_base_control.arm import XArmHandler  # noqa: E402
 
 # Joint-angle trajectory (degrees) from home -> selfie pose.
 # Index 0 is home; the last entry is the desired selfie position.
@@ -55,14 +61,38 @@ def get_arm():
     global _arm_handler
     with _arm_lock:
         if _arm_handler is None:
-            _arm_handler = XArmAPI(ARM_IP, is_radian=False)
-            _arm_handler.connect()
+            _arm_handler = XArmHandler(
+                robot_ip=ARM_IP, gripper=None, dynamic_recovery_enabled=True
+            )
     return _arm_handler
+
+
+def _release_for_takeover():
+    """Off-loop: another launcher wants the arm. Drop it so the lease frees cooperatively."""
+    def _run():
+        with _arm_lock:
+            try:
+                arm_release()   # deliberately NOT move_arm_home: the taker adopts the pose
+            except Exception as e:
+                print(f"[selfie] releasing the arm for a takeover failed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _register_takeover_hook():
+    """Answer ABC's cooperative takeover wait instead of waiting to be SIGKILLed."""
+    try:
+        from arm_base_control.resource_lease import default_lease
+        default_lease().on_takeover(_release_for_takeover)
+    except Exception as e:
+        print(f"[selfie] takeover hook unavailable: {e}")
+
+
+_register_takeover_hook()
 
 
 def arm_current_angles():
     """Read the live first-6 joint angles, or None if unavailable."""
-    code, angles = get_arm().get_servo_angle()
+    code, angles = get_arm().api_get_servo_angle(is_radian=False)
     if code != 0 or angles is None:
         return None
     return list(angles[:6])
@@ -79,12 +109,12 @@ def arm_at_pose(target, tol=ARM_POSE_TOL_DEG):
 def arm_ready():
     """Clear faults and put the arm in position-control ready state."""
     arm = get_arm()
-    arm.clean_error()
-    arm.clean_warn()
+    arm.arm.clean_error()
+    arm.arm.clean_warn()
     time.sleep(0.5)
-    arm.motion_enable(enable=True)
-    arm.set_mode(6)   # mode 6 per original specification
-    arm.set_state(state=0)  # ready
+    arm.arm.motion_enable(True)
+    arm.api_set_mode(6)   # position control
+    arm.api_set_state(0)  # ready
     time.sleep(0.2)
 
 
@@ -93,7 +123,7 @@ def arm_follow(waypoints):
     intermediate pose is honored (never a single direct move to the goal)."""
     arm = get_arm()
     for i, wp in enumerate(waypoints):
-        code = arm.set_servo_angle(
+        code = arm.api_set_servo_angle(
             angle=list(wp), speed=ARM_SPEED, mvacc=ARM_MVACC, wait=True
         )
         if code != 0:
@@ -126,7 +156,7 @@ def move_arm_to_selfie():
 
 
 def arm_release():
-    """Reset the arm and relinquish programmatic control by switching to mode 1.
+    """Reset the arm, hand back mode-1 control, and release the arm/base lease.
 
     Clears any faults/warnings first (reset), then drops the arm into mode 1 —
     the xArm servo-motion mode that gives up position-control ownership and
@@ -135,18 +165,27 @@ def arm_release():
 
     No-op if we never connected to the arm this session, so a disconnect with no
     prior arm activity won't open a connection just to release it.
+
+    Also disconnects the handler. XArmHandler.disconnect() is the only path that calls
+    ResourceLease.release(), so without it this process holds /dev/shm/sbot.lease for its
+    whole lifetime and every teleop takeover ends in a SIGKILL and a systemd restart.
     """
-    global _arm_deployed
+    global _arm_deployed, _arm_handler
     with _arm_lock:
         if _arm_handler is None:
             return
         arm = _arm_handler
-        arm.clean_error()
-        arm.clean_warn()
+        arm.arm.clean_error()
+        arm.arm.clean_warn()
         time.sleep(0.3)
-        arm.set_mode(1)   # servo motion mode -> hand off control
-        arm.set_state(state=0)  # apply the mode
+        arm.api_set_mode(1)   # servo motion mode -> hand off control
+        arm.api_set_state(0)  # apply the mode
         _arm_deployed = False
+        try:
+            arm.disconnect()      # the only route that releases the arm/base lease
+        except Exception as e:
+            print(f"[selfie] arm disconnect failed: {e}")
+        _arm_handler = None       # next get_arm() reconnects and re-acquires
 
 
 def move_arm_home():
