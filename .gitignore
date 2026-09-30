@@ -1,3 +1,10 @@
+station.toml
+static/
+logs/
+third_party/
+.venv/
 venv/
+.uv-cache/
 __pycache__/
 *.pyc
+.pytest_cache/
