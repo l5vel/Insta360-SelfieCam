@@ -24,6 +24,13 @@ class FakeArm:
         self.x = 300.0
         self.position_code = 0
         self.freeze = False
+        self.gripper = "robotiq"
+        self.open_result = True
+        self.opened_at = None       # how many moves had run when the gripper opened
+
+    def gripper_open(self, blocking=None):
+        self.opened_at = len(self.moves)
+        return self.open_result
 
     def api_get_servo_angle(self, **kwargs):
         return self.read_code, self.pose
@@ -91,6 +98,37 @@ class ArmWorkflowTests(unittest.TestCase):
         self.assertEqual(self.arm.modes, [0, 0, 2])
         self.assertTrue(self.arm.disconnected)
         self.assertIsNone(control._arm_handler)
+
+    def test_the_gripper_opens_before_the_first_waypoint_out(self):
+        control.move_arm_to_selfie()
+        self.assertEqual(self.arm.opened_at, 0)
+        self.assertEqual(self.arm.moves, control.ARM_TRAJECTORY[1:])
+
+    def test_a_gripper_that_does_not_open_keeps_the_arm_home(self):
+        self.arm.open_result = False
+        with self.assertRaisesRegex(RuntimeError, "gripper did not open"):
+            control.move_arm_to_selfie()
+        self.assertEqual(self.arm.moves, [])
+
+    def test_an_arm_base_control_that_cannot_say_logs_it_and_goes_out(self):
+        self.arm.open_result = None
+        with self.assertLogs("uvicorn.error.arm", "WARNING") as logs:
+            control.move_arm_to_selfie()
+        self.assertIn("does not report whether the gripper opened", logs.output[0])
+        self.assertEqual(self.arm.moves, control.ARM_TRAJECTORY[1:])
+
+    def test_an_arm_with_no_gripper_goes_out_without_one(self):
+        self.arm.gripper = None
+        control.move_arm_to_selfie()
+        self.assertIsNone(self.arm.opened_at)
+        self.assertEqual(self.arm.moves, control.ARM_TRAJECTORY[1:])
+
+    def test_the_station_builds_its_arm_with_the_robots_gripper(self):
+        import ast
+        from pathlib import Path
+        tree = ast.parse(Path(control.__file__).read_text())
+        built = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "SelfieArmHandler"]
+        self.assertEqual([ast.unparse(k.value) for n in built for k in n.keywords if k.arg == "gripper"], ["GRIPPER"])
 
     def test_disconnect_before_deployment_does_not_move(self):
         control.move_arm_home()
@@ -295,6 +333,28 @@ class HandoverTests(unittest.TestCase):
         control._arm_handler = None
         control.hand_over()
         self.assertFalse(self.arm.disconnected)
+
+    def test_release_where_it_stands_lets_go_of_an_arm_that_is_out_without_moving_it(self):
+        control.move_arm_to_selfie()
+        moves = len(self.arm.moves)
+        self.assertTrue(control.release_where_it_stands())
+        self.assertEqual(len(self.arm.moves), moves, "the release moves nothing")
+        self.assertEqual(self.arm.moves_at_disconnect, moves)
+        self.assertIsNone(control._arm_handler)
+        self.assertFalse(control.deployed(), "the idle shutoff must not try to bring home an arm it let go")
+
+    def test_release_where_it_stands_with_no_arm_held_says_so(self):
+        control._arm_handler = None
+        self.assertFalse(control.release_where_it_stands())
+        self.assertFalse(self.arm.disconnected)
+
+    def test_a_takeover_after_the_release_finds_nothing_to_bring_home(self):
+        control.move_arm_to_selfie()
+        control.release_where_it_stands()
+        moves = len(self.arm.moves)
+        control.hand_over()
+        self.assertEqual(len(self.arm.moves), moves)
+
 
     def test_the_takeover_callback_only_starts_the_handover_thread(self):
         ran = threading.Event()

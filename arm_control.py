@@ -38,6 +38,8 @@ ARM_SELFIE_POSE = ARM_TRAJECTORY[-1] if ARM_TRAJECTORY else None
 ARM_POSE_TOL_DEG = float(getattr(_SELFIE, "tolerance_deg", 0))
 ARM_SPEED = float(getattr(_SELFIE, "speed", 0))
 ARM_MVACC = float(getattr(_SELFIE, "mvacc", 0))
+# The robot's gripper, opened before the arm goes out for a selfie; None when it has none.
+GRIPPER = getattr(getattr(_ARM_CFG, "gripper", None), "type", None)
 ARM_MOVE_TIMEOUT_SEC = 30
 ARM_SETTLE_SEC = 0.5
 LOG = logging.getLogger("uvicorn.error.arm")
@@ -81,7 +83,7 @@ def get_arm(takeover=False):
                 raise ArmLeaseConflict(name, pid, mode, task)
             # Safe to connect / construct the robot handler now.
             _arm_handler = SelfieArmHandler(
-                robot_ip=ARM_IP, gripper=None, dynamic_recovery_enabled=False, lease_mode="selfie"
+                robot_ip=ARM_IP, gripper=GRIPPER, dynamic_recovery_enabled=False, lease_mode="selfie"
             )
             _watch_takeover(lease)
         return _arm_handler
@@ -102,7 +104,6 @@ def _on_takeover():
 
 def hand_over():
     """Give the arm to a launcher that asked for it: home it along the selfie path when it is out, then let go."""
-    global _arm_handler, _arm_deployed, _last_waypoint_index
     with _arm_lock:
         if _arm_handler is None:
             return
@@ -111,12 +112,28 @@ def hand_over():
             move_arm_home()
         except Exception as exc:
             LOG.error("could not return the arm home (%s); releasing it where it stands", exc)
-        try:
-            _arm_handler.disconnect()  # releases the ArmBaseControl ownership lease
-        finally:
-            _arm_handler = None
-            _arm_deployed = False
-            _last_waypoint_index = None
+        _let_go()
+
+
+def release_where_it_stands():
+    """Let go of the arm without moving it, for a launcher that brings it up where it stands; False when none is held."""
+    with _arm_lock:
+        if _arm_handler is None:
+            return False
+        LOG.warning("releasing the arm where it stands for a launcher that leaves it there")
+        _let_go()
+        return True
+
+
+def _let_go():
+    """Release the lease and forget the arm; the caller holds _arm_lock."""
+    global _arm_handler, _arm_deployed, _last_waypoint_index
+    try:
+        _arm_handler.disconnect()  # releases the ArmBaseControl ownership lease
+    finally:
+        _arm_handler = None
+        _arm_deployed = False
+        _last_waypoint_index = None
 
 
 def arm_current_angles(takeover=False):
@@ -203,6 +220,18 @@ def arm_ready(takeover=False):
     time.sleep(0.2)
 
 
+def _open_gripper(takeover=False):
+    """Open the gripper before the first waypoint out; refuse the move when it reports it did not open."""
+    arm = get_arm(takeover=takeover)
+    if arm.gripper is None:
+        return
+    opened = arm.gripper_open(blocking=True)
+    if opened is None:
+        LOG.warning("this ArmBaseControl does not report whether the gripper opened; going out anyway")
+    elif opened is not True:
+        raise RuntimeError(f"The gripper did not open ({opened}), so the arm stayed home")
+
+
 def _follow_indices(indices, takeover=False):
     global _last_waypoint_index
     arm = get_arm(takeover=takeover)
@@ -237,6 +266,7 @@ def move_arm_to_selfie(takeover=False):
         _last_waypoint_index = 0
         _arm_deployed = True  # permit recovery if a later waypoint fails
         arm_ready(takeover=takeover)
+        _open_gripper(takeover=takeover)
         _follow_indices(range(1, len(ARM_TRAJECTORY)), takeover=takeover)
         time.sleep(ARM_SETTLE_SEC)
 

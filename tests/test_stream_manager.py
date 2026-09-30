@@ -1,5 +1,7 @@
 import queue
+import time
 import unittest
+import unittest.mock
 import numpy as np
 from stream_manager import _apply_crop, generate_equirectangular_maps, _safe_q_put, UnifiedStreamManager
 from sandbox import setUpModule, tearDownModule  # noqa: F401
@@ -30,6 +32,18 @@ class PreviewTests(unittest.TestCase):
         manager.stop()
         self.assertIsNone(manager.error())
         self.assertIsNone(manager.processing_process)
+
+    def test_live_only_while_a_running_preview_delivers_frames(self):
+        manager = UnifiedStreamManager()
+        self.assertFalse(manager.live())
+        manager.processing_process = unittest.mock.Mock(is_alive=lambda: True)
+        self.assertFalse(manager.live(), 'running, but no frame yet')
+        manager.ready.set()
+        manager.last_frame.value = time.monotonic()
+        self.assertTrue(manager.live())
+        manager.last_error = 'Preview failed'
+        self.assertFalse(manager.live())
+        manager.processing_process = None
 
     def test_invalid_srt_address_fails_before_start(self):
         manager = UnifiedStreamManager()

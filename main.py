@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 import logging
 import os
 import queue
@@ -149,12 +150,20 @@ def apply_border_and_logo(
 async def serve_frontend():
     return FileResponse("index.html")
 
+# The last frame each preview stream sent, and when, so /save-frame keeps exactly what a client was shown.
+SENT_FRAMES = {}
+# Where /save-frame writes, and the oldest sent frame it still saves.
+FRAMES_DIR = Path("logs/frames")
+FRAME_FRESH_S = 2.0
+
+
 async def mjpeg_generator(queue_name):
     """Yields MJPEG stream boundaries from the multiprocessing queue."""
     while True:
         try:
             q = getattr(stream_manager, queue_name)
             frame_bytes = await asyncio.to_thread(q.get, timeout=1.0)
+            SENT_FRAMES[queue_name] = (frame_bytes, time.monotonic())
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         except (queue.Empty, ValueError, OSError):
             await asyncio.sleep(0.1)
@@ -182,6 +191,19 @@ async def stream_feed_equirec():
         mjpeg_generator("mjpeg_queue_equirec"),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
+
+@app.post("/save-frame")
+def save_frame(request: Request):
+    """Save the 360 frame /stream/equirec last sent, byte for byte, under FRAMES_DIR."""
+    sent = SENT_FRAMES.get("mjpeg_queue_equirec")
+    if sent is None or time.monotonic() - sent[1] > FRAME_FRESH_S:
+        raise HTTPException(status_code=409, detail="No 360 frame is being sent right now; the Operator "
+                                                    "view's stream must be running.")
+    FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+    path = FRAMES_DIR / datetime.now().strftime("frame-%Y%m%d-%H%M%S-%f.jpg")
+    path.write_bytes(sent[0])
+    logging.getLogger("uvicorn.error.camera").info("save-frame from %s: %s", _who(request), path)
+    return {"status": "success", "path": str(path)}
 
 @app.get("/status")
 def get_status(operation_id: str | None = None):
@@ -213,6 +235,14 @@ def position_arm(request: Request, takeover: bool = False):
 def keep_active():
     """The page's sign that someone is still using it; the middleware records it."""
 
+
+@app.post("/release-arm")
+def release_arm(request: Request):
+    """Let go of the arm where it stands, for a launcher that brings it up there; nothing moves."""
+    released = arm_control.release_where_it_stands()
+    arm_control.LOG.info("release-arm from %s: %s", _who(request),
+                         "released the arm where it stands" if released else "this app held no arm")
+    return {"released": released}
 
 @app.post("/home-arm")
 def home_arm():

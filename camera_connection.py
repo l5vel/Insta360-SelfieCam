@@ -43,6 +43,9 @@ WAKE_BEACON = wake_beacon(SERIAL)
 CAMERA_BT_NAME = f'X5 {SERIAL}'
 # How often a connected camera link is checked between operations.
 LINK_CHECK_S = 3.0
+# While the preview runs the battery is read this often, and a reading older than BATTERY_FRESH_S is not shown.
+BATTERY_READ_S = 30.0
+BATTERY_FRESH_S = 60.0
 SYS_NET = Path('/sys/class/net')
 # The beacon runs this long, the camera's Wi-Fi may appear this long after it, checked this often.
 WAKE_BEACON_S = 60.0
@@ -150,6 +153,8 @@ class CameraConnectionManager:
         self.link_expected = False   # a connect reached ready and no disconnect has run since
         self.link = ''               # why the connected link is unhealthy, '' when it is fine
         self.helper_scan_down = ''   # why the helper's scan last could not run, '' when it ran
+        self.battery = None          # (percent, monotonic time read) from the camera's OSC state
+        self._battery_tried = float('-inf')
         self._watch_stop = threading.Event()
 
     def start(self):
@@ -204,13 +209,14 @@ class CameraConnectionManager:
                 if operation_id:
                     raise KeyError(operation_id)
                 return {'status': 'idle', 'stage': 'idle', 'message': 'Waiting to connect...', 'done': True,
-                        'link': self.link}
+                        'link': self.link, 'battery': self._battery_status()}
 
             result = {key: op[key] for key in ('id', 'kind', 'stage', 'message', 'done', 'result')}
             result['detail'] = op.get('detail', '')
             result['status'] = op['stage']
             result['timings'] = dict(op['timings'])
             result['link'] = self.link
+            result['battery'] = self._battery_status()
 
             finish_time = op.get('finished') or time.monotonic()
             result['elapsed'] = round(finish_time - op['started'], 3)
@@ -315,7 +321,7 @@ class CameraConnectionManager:
     def _link_ends(self, op):
         """A connect that failed or was cancelled leaves no link to watch."""
         if op['kind'] == 'connect':
-            self.link_expected, self.link = False, ''
+            self.link_expected, self.link, self.battery = False, '', None
 
     def _link_problem(self):
         """Why the connected camera link is unhealthy, or '' when it is fine."""
@@ -344,8 +350,47 @@ class CameraConnectionManager:
         while not self._watch_stop.wait(LINK_CHECK_S):
             try:
                 self._check_link()
+                self._check_battery()
             except Exception:
                 LOG.exception('camera link check failed')
+
+    # --- BATTERY ---
+
+    def _check_battery(self):
+        """Read the battery while the preview runs, at most every BATTERY_READ_S; forget it once the link is gone."""
+        if not self.link_expected or self.link:
+            self.battery, self._battery_tried = None, float('-inf')
+            return
+        now = time.monotonic()
+        if not self.stream.live() or now - self._battery_tried < BATTERY_READ_S:
+            return
+        self._battery_tried = now
+        percent = self._read_battery()
+        if percent is not None:
+            self.battery = (percent, now)
+
+    @staticmethod
+    def _read_battery():
+        """The camera's battery in percent from its OSC state, or None when it did not say."""
+        try:
+            with requests.Session() as http:
+                http.trust_env = False
+                level = float(http.post(f'http://{CAMERA_IP}/osc/state', json={},
+                                        timeout=GATE_PROBE_S).json()['state']['batteryLevel'])
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            LOG.info('camera battery not read: %s', exc)
+            return None
+        if not 0.0 <= level <= 1.0:
+            LOG.info('camera battery not read: batteryLevel %r is outside 0..1', level)
+            return None
+        return round(level * 100)
+
+    def _battery_status(self):
+        """{'percent', 'age_s'} while the last reading is fresh, else None."""
+        if self.battery is None:
+            return None
+        age = time.monotonic() - self.battery[1]
+        return {'percent': self.battery[0], 'age_s': round(age, 1)} if age < BATTERY_FRESH_S else None
 
     # --- INTERNAL WORKFLOWS ---
 
@@ -705,7 +750,7 @@ class CameraConnectionManager:
     def _disconnect(self, op, home_arm):
         """Tears down the stream and network connections safely."""
         self._stage(op, 'disconnecting', 'Stopping preview and disconnecting camera...')
-        self.link_expected, self.link = False, ''
+        self.link_expected, self.link, self.battery = False, '', None
 
         self.stream.stop()
         warnings = []

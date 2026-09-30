@@ -157,6 +157,15 @@ class HelperMismatchTests(unittest.TestCase):
         helper.assert_called_once_with('check')
 
 
+class ReleaseArmEndpointTests(unittest.TestCase):
+    def test_the_release_endpoint_lets_go_where_the_arm_stands_and_says_what_happened(self):
+        request = Mock(client=Mock(host='198.51.100.49'))
+        for held in (True, False):
+            with patch.object(main.arm_control, 'release_where_it_stands', return_value=held) as release:
+                self.assertEqual(main.release_arm(request), {'released': held})
+            release.assert_called_once_with()
+
+
 class EmailSenderTests(unittest.TestCase):
     def test_email_refuses_with_the_reason_when_no_sender_is_set(self):
         with patch.multiple(main, GMAIL_USERNAME='', GMAIL_USERNAME_UNSET='station.toml has no [email] sender',

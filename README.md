@@ -194,6 +194,18 @@ should take about 10 s at the configured speed, which fits inside the 15 s the d
 waits. That figure is computed from the path and has not been measured. An arm the retrace cannot place
 on the path is released where it stands, and the journal logs why.
 
+A dashboard set to leave the arm where it stands asks first with `POST /release-arm`. The app then
+lets go of the arm without moving it and answers whether it held one. Its idle shutoff no longer
+counts the arm as out, so nothing brings it home later, and the takeover that follows finds nothing
+to retrace.
+
+### Saving a frame
+
+`POST /save-frame` writes the 360 frame `/stream/equirec` last sent, byte for byte, to
+`logs/frames/frame-<date>-<time>.jpg` and answers with the path. It fires no shutter, pauses nothing
+and applies no crop, border or logo, so it records exactly what a client such as the dashboard's
+Operator view was shown. It refuses with 409 when no frame went out in the last 2 s.
+
 ### Deploying and bringing the arm home
 
 Importing `arm_control` leaves the robot alone until a request needs the arm. Deployment starts from the
@@ -306,23 +318,28 @@ root, and bluetoothd confirms the beacon on the air. `btmgmt` 5.72 hangs after e
 `--version`, so nothing here uses it. A sleeping camera stays silent on Bluetooth, but it listens for the
 beacon.
 
-Every station connect that found the camera asleep woke it with its Wi-Fi, ten times out of ten. The
-table lists each wake by how long the camera had gone unseen before the beacon, taken from the app's
-journal. The second column is when the app's scans first heard the camera's Wi-Fi, counted from the
-start of the beacon.
+Thirteen of the fourteen station connects that found the camera's Wi-Fi off woke it with its Wi-Fi. The
+one that failed sent its beacon 2.0 min after the camera was last seen, and afterwards the camera was
+no longer advertising. The table lists each wake by how long the camera had gone unseen before the
+beacon, taken from the app's journal. The second column is when the app's scans first heard the
+camera's Wi-Fi, counted from the start of the beacon.
 
 | camera last seen awake | Wi-Fi heard |
 |---|---|
 | about 3.5 h before | 52 s |
+| about 2 h before | 21 s |
 | about 100 min before | 23 s |
 | about 48 min before | 21 s |
+| 16.0 min before | 51 s |
 | 14.7 min before | 73 s |
 | 10.8 min before | 42 s |
 | 8.1 min before | 20 s |
 | 7.6 min before | 61 s |
+| 4.8 min before | 30 s |
 | 3.1 min before | 28 s |
 | 2.8 min before | 51 s |
 | 2.3 min before | 30 s |
+| 2.0 min before | not heard |
 
 The camera's Wi-Fi starts sooner than the app hears it. In three wakes the recorder captured, it came
 up 11.3 s and 12.5 s after the beacon started when the camera had slept for minutes or about 48 min,
@@ -331,14 +348,15 @@ that starts after the Wi-Fi does hears the camera, and in the two shorter wakes 
 behind NetworkManager's. The wake gives the camera 80 s, the 60 s beacon plus 20 s of scans, so a longer
 sleep eats into that margin.
 
-A beacon sent while the camera is awake with its Wi-Fi timed out does nothing,
-as one connect showed, and "Known failures" covers that case.
+A beacon sent while the camera is awake with its Wi-Fi timed out does nothing, as one connect showed.
+The failed wake in the table fits the same case, and "Known failures" covers it.
 
 ### The camera's own timers and settings
 
 The camera turns its Wi-Fi off 2 minutes after its preview connection closes. That was measured twice to
 the second, and two more gaps of the same length match it. A capture closes that connection, and the
-Wi-Fi goes off even while the robot's adapter stays joined. Left alone, the camera falls asleep two to
+Wi-Fi goes off even while the robot's adapter stays joined. One exception has no known cause yet: after
+one capture the camera stopped beaconing about 13 s after the preview closed. Left alone, the camera falls asleep two to
 four minutes after waking.
 
 The camera's menu shows firmware 1.11.6 with MCU 1.2.5 on hardware 620. Auto Power Off is set to 3
@@ -352,6 +370,15 @@ The app assumes the camera's Wi-Fi is always on 5 GHz. The profile's band is `a`
 covers only 5 GHz channels, so a camera switched to 2.4 GHz would be neither found nor joined. The
 camera's region is set to America, so it picks a channel from 36 to 48 or 149 to 165 each time its Wi-Fi
 starts. The logs show 36, 48 and 149, and the one sweep covers any other channel.
+
+### The camera's battery
+
+While the preview runs, the app reads the camera's battery every 30 s from its OSC state, `POST
+/osc/state`, which answers `state.batteryLevel` from 0 to 1. The X5 answered 0.82 in 0.01 s on its
+first read, and its state carries no charging flag. `/status` carries the reading as `battery` with
+`percent` and `age_s` while it is under 60 s old, and as `null` otherwise. Nothing is read while the
+preview is stopped, because whether a request resets the camera's 2-minute Wi-Fi timer is untested. The
+reading is forgotten once the link ends, so a disconnected camera never shows a number.
 
 ### Recording the camera link
 
@@ -482,8 +509,10 @@ been tried.
 ### A wake beacon brings nothing back
 
 A beacon sent while the camera is awake with its Wi-Fi timed out does nothing, as one sequence showed.
-The camera falls asleep about two minutes later, and a beacon then wakes it with its Wi-Fi. Switch the
-Wi-Fi on at the camera, or wait and press Connect again. The dependable fix would switch the Wi-Fi on
+The camera falls asleep about two minutes later, and a beacon then wakes it with its Wi-Fi. A second
+failure fits this case: a beacon 2.0 min after the Wi-Fi went off brought nothing back, and the next
+Connect, 4.8 min after, woke the camera in 30 s. Switch the Wi-Fi on at the camera, or wait and press
+Connect again. The dependable fix would switch the Wi-Fi on
 remotely with the camera's open-Wi-Fi command (`PHONE_COMMAND_OPEN_CAMERA_WIFI`, code 33). The Insta360
 app sends that over the camera's Bluetooth control link, which this app has yet to implement.
 
@@ -494,6 +523,14 @@ record the adapter most likely missed a camera that was on. One ran while the ad
 channel 64, and in the other NetworkManager's full scans heard the camera on channel 36 only after the
 connect had ended. A busy adapter ends the connect with the retry prompt, which closes that second path. Press Connect again. If the detail repeats, check the adapter with
 `/usr/local/libexec/selfie-camera-control check`, then switch the Wi-Fi on at the camera.
+
+### The phone shows "Loading live feed..." after Connect
+
+A connect reaches "preview ready", but the phone keeps showing "Loading live feed..." until Take Picture
+changes the screen. The cause is not confirmed yet. The page reveals the feed only when the preview
+image fires its `load` event, and whether the phone's browser fires it for a live MJPEG stream is
+untested. Frames reaching the phone have not been counted either. Take Picture still poses the arm and
+takes the photo.
 
 ### A capture fails while the camera is in video mode
 

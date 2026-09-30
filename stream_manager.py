@@ -82,6 +82,11 @@ class UnifiedStreamManager:
             return 'No camera video received for 10 seconds.'
         return None
 
+    @synchronized
+    def live(self):
+        """Whether the preview is running and delivering frames."""
+        return bool(self.processing_process and self.ready.is_set() and not self.error())
+
     def wait_ready(self, deadline):
         end = min(deadline.end, time.monotonic() + 15)
         while True:
