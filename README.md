@@ -1,9 +1,119 @@
 # Selfie station
 
+**Read [Need to know](#need-to-know) before you use this code.** It lists when the arm moves, including
+with no press, what a phone press does to a robot session that holds the arm, and what the app exposes
+on the network.
+
 The selfie station poses the robot's arm with an Insta360 X5 camera, shows a live preview on a phone
 page and takes the picture. This FastAPI app serves that page on port 8000. It drives the arm through
 ArmBaseControl and reaches the camera over the camera's own Wi-Fi, through a USB Wi-Fi adapter kept for
 the camera alone.
+
+## Need to know
+
+This section lists what can move the arm or change the robot's state when you may not expect it. Each
+item says when it happens and what to do, and the linked sections hold the full explanations.
+
+### Arm motion
+
+- **Take Picture moves the arm at once.** The page posts `/position-arm?takeover=true`, and the arm sets
+  out before the camera check and the 3 s countdown, so a camera that then fails leaves the arm out. On
+  base03 the `arm.selfie` path turns J1 through 180 degrees at 30 degrees per second and ends behind the
+  robot near the VLA cameras. Keep that whole swing clear while the page is open to visitors. See
+  [Taking a picture](#taking-a-picture).
+- **The app brings the arm home on its own.** Two minutes after the last POST from any client, with an
+  arm this app sent out and no camera work running, the app disconnects the camera and retraces the path
+  home. It then switches the arm to joint teaching mode, so the arm moves freely by hand until another
+  program takes it. This happens with no press, so keep the swing clear for two minutes after the last
+  use. See [Deploying and bringing the arm home](#deploying-and-bringing-the-arm-home).
+- **Any open page can end a session and send the arm home.** The Disconnect button and each page's own
+  2-minute timer post `/disconnect?home_arm=true`. That request cancels camera work another client
+  started, takes the camera's Wi-Fi down for every client, and brings home an arm this app sent out. A
+  second phone or a stale tab whose timer runs out after someone else connected ends that person's
+  session this way, so keep one page open per session. See
+  [Deploying and bringing the arm home](#deploying-and-bringing-the-arm-home).
+- **An arm off the path goes home in straight joint moves.** When the arm matches no waypoint, the next
+  Take Picture, Disconnect, idle shutoff or handover moves it to the controller's initial point and then
+  to the path's home. The only guard checks the starting pose and stops with "Arm needs a manual reset"
+  when the TCP x there is below `arm.home_caution_x_mm` or cannot be read. Bring an arm left off the path
+  home from the dashboard or by hand, because a robot config without that key gets no check at all. See
+  ["Arm needs a manual reset"](#arm-needs-a-manual-reset).
+- **The gripper opens before the arm goes out.** With `arm.gripper.type` set in the robot config, the
+  app opens the gripper at the path's home before the first waypoint, so anything it holds drops there.
+  An object a robot session was still holding when a phone took the arm drops there too. A gripper that
+  reports it did not open keeps the arm home, and the reason goes to the journal while the page shows its
+  plain arm message.
+
+### Stops
+
+- **The page cannot stop the arm.** The app has no stop endpoint, and the page disables Disconnect for
+  all of Take Picture, including a camera wake that can run for 200 s. Stop the arm with the robot's
+  e-stop, whose latch refuses the app's moves while it is set (ArmBaseControl README, Need to know). In
+  the code the idle shutoff retries every 2 minutes and moves the arm on its first try after the latch
+  clears, so post `/release-arm` before you release an e-stop with the arm out.
+- **The next request clears a controller fault and moves the arm.** Before every move the app clears the
+  controller's error and warning codes, so a stop from a collision or kinematic fault lasts only until
+  the next Take Picture, Disconnect or idle shutoff. After a fault, check the arm and the people near it
+  at once, because the idle shutoff can move the arm about 2 minutes later.
+- **Stopping or restarting the app leaves the arm out.** A stop or restart of `selfie.service` closes the
+  camera and leaves the arm where it stands, which can be the selfie pose behind the robot. The restarted
+  app has no record that it sent the arm out, so its idle shutoff leaves the arm there. Bring the arm home
+  before a restart, with Disconnect on the page or from the dashboard.
+
+### When a robot session holds the arm
+
+- **A phone press ends the robot session that holds the arm.** Take Picture asks for the arm with
+  takeover, so a running SBot session aborts its task, even mid-pick, lets go of the arm where it stands,
+  and closes (SBot README, Need to know). The dashboard sees its session end, and its Connect relaunches
+  the session, which is a short relaunch. Sending the phone's pose and return to a running robot session,
+  so the lease stays put, is planned and not built. See [Sharing the arm](#sharing-the-arm).
+- **A press can force-stop an owner that does not let go.** ArmBaseControl force-stops an owner whose
+  lease heartbeat has gone stale. It does the same to an owner that still holds the arm after 15 s, when
+  that owner is one of the robot's own launchers or runs outside a managed systemd service. Force-stopping
+  sends SIGTERM and then SIGKILL, so nothing safes the arm first (ArmBaseControl README, Need to know). See
+  [Sharing the arm](#sharing-the-arm).
+- **Another program's launch sends the arm home.** While this app has the arm out, any launcher that asks
+  for the lease, such as the dashboard's Take over, makes the app retrace the path home and let go. When
+  the dashboard's "Arm at startup" is "Leave it where it stands", the dashboard first posts
+  `/release-arm`, and nothing moves (SBotDashboard README, Need to know). The arm then stays where it is,
+  possibly at the selfie pose, and the app's idle shutoff no longer brings it home. See
+  [Sharing the arm](#sharing-the-arm).
+
+### Hardware and system changes
+
+- **The camera adapter helper changes the system as root.** A Connect, or a Take Picture that finds the
+  camera silent, runs the helper's `scan` through sudo, and its `reset` when the adapter fails its check.
+  A reset unloads and reloads the `mt76x2u` driver, which drops every adapter that driver serves, and the
+  boot unit `selfie-camera-adapter.service` resets a broken adapter at startup. The installer and each
+  boot add an unreachable route for the camera's whole /24, so keep other networks the robot uses off
+  that subnet. See [The adapter helper](#the-adapter-helper).
+- **Disconnect takes down whichever profile `station.toml` names.** Every Disconnect and idle shutoff
+  runs `nmcli connection down` on the `[camera] nm_profile_uuid` profile without naming an interface, and
+  nothing checks that the profile belongs to the camera's adapter. A UUID copied from the robot's own
+  Wi-Fi profile would drop the robot's network on the next Disconnect, so confirm the UUID names the
+  camera's profile. See [The camera's network profile](#the-cameras-network-profile).
+
+### Tests and scripts
+
+- **Arm tests stay off the real arm only by convention.** Each test in `tests/test_arm_control.py`
+  installs a fake handler before it calls the app, and nothing else stops a test from building a real
+  `SelfieArmHandler`. A real handler would take the arm lease when it is free and connect to the arm at
+  172.16.0.13, so keep new arm tests on the fake. The camera tests take a fake helper, scan lock and
+  station values from `tests/sandbox.py`, and each test mocks its own `nmcli`, `bluetoothctl` and socket
+  calls. See [Tests](#tests).
+
+### Network, data and secrets
+
+- **Anyone who reaches port 8000 can drive the station.** `selfie.service` serves the app on 0.0.0.0:8000
+  with no authentication and CORS open to every origin. Any device on base03's networks, or a web page
+  open on one, can post `/position-arm?takeover=true`, `/home-arm`, `/disconnect?home_arm=true` or
+  `/release-arm`, and can view `/stream`, `/stream/equirec` and the last photo at `/static/latest.jpg`.
+  Run the station only on a network limited to people who may move the arm and see its pictures.
+- **Photos and video can leave the robot.** `/email` signs in to the Gmail account in `station.toml` with
+  the app password from `GMAIL_APP_PASSWORD` and sends `static/latest.jpg` to any address a client names.
+  Every capture overwrites that file, so a second picture taken before the first visitor presses Send
+  goes to the first visitor. `POST /connect?client_ip=<IPv4>` pushes the camera's video over SRT to port
+  7003 at that address, and later reconnects keep sending there.
 
 ## Setup
 
@@ -47,10 +157,11 @@ interface, the camera profile's UUID, the camera's serial and address, and the G
 photos. Copy `station.example.toml` to `station.toml` and fill it in. The serial is the six characters
 after "X5 " in the camera's Bluetooth name, and the app builds both the wake beacon and that name from it.
 
-While a camera value is missing, the app still starts and the arm still works. Connect, Take Picture and
-Resume stop with the station user's usual line and name the missing value in the detail. Disconnect
-still brings the arm home and says it left the Wi-Fi alone. Email needs `[email] sender` and
-`GMAIL_APP_PASSWORD`, and without either `/email` answers 503 and names what is missing.
+While a camera value is missing, the app still starts and the arm still works. Connect and Resume stop
+with the station user's usual line and name the missing value in the detail. Take Picture stops the same
+way once the arm has already gone out to the selfie pose. Disconnect still brings the arm home and says
+it left the Wi-Fi alone. Email needs `[email] sender` and `GMAIL_APP_PASSWORD`, and without either
+`/email` answers 503 and names what is missing.
 
 ### The camera's network profile
 
@@ -95,7 +206,8 @@ different adapter from `station.toml`.
 
 `selfie-camera-adapter.service` runs `boot` once at startup, and `journalctl -u selfie-camera-adapter`
 shows its result. Nothing waits for it, so SBot and teleop start on their own schedule. The app runs
-`check` only when someone presses Connect, and SBot and teleop never run it.
+`check` only when a Connect, or a Take Picture that finds the camera silent, has to join the camera's
+Wi-Fi, and SBot and teleop never run it.
 
 ### Running as a service
 
@@ -184,15 +296,18 @@ The phone page takes the arm directly. Take Picture posts `/position-arm?takeove
 whoever holds the arm lease to release it and waits up to 15 s. An SBot session answers by aborting its
 running task and letting a selfie hold go where the arm stands. It tells its dashboard that another
 program took the arm, then closes within its 8 s teardown. That report is lost when the session's status
-wire closes first. If the owner keeps the arm, the page shows its plain arm message and the journal names
-the owner.
+wire closes first. An owner whose lease heartbeat has gone stale is force-stopped at once. One that still
+holds the arm after 15 s is force-stopped too when it is one of the robot's own launchers or runs outside
+a managed systemd service. Force-stopping sends SIGTERM and then SIGKILL, so nothing safes the arm first.
+An owner inside a managed service keeps the arm, the page shows its plain arm message, and the journal
+names the owner.
 
 The dashboard asks for the arm the same way. When it connects while this app holds the arm, its takeover
 dialog names the selfie station and offers Take over and Cancel. Take over has this app bring the arm
 home along the `arm.selfie` path, then disconnect and release the lease. From the selfie pose the retrace
-should take about 10 s at the configured speed, which fits inside the 15 s the dashboard's supervisor
-waits. That figure is computed from the path and has not been measured. An arm the retrace cannot place
-on the path is released where it stands, and the journal logs why.
+took 12.1 s in its one timed run, when the idle shutoff made it. That leaves about 3 s of the 15 s the
+dashboard's supervisor waits. An arm the retrace cannot place on the path is released where it stands,
+and the journal logs why.
 
 A dashboard set to leave the arm where it stands asks first with `POST /release-arm`. The app then
 lets go of the arm without moving it and answers whether it held one. Its idle shutoff no longer
@@ -236,7 +351,8 @@ An arm off the path with its TCP x below `arm.home_caution_x_mm` sits behind the
 cameras. base03 sets the line at 50 mm, and only the selfie pose and the basket dropoff, which is not
 configured yet, take the arm behind it. From there ARM HOME asks the operator before a straight move, and
 only Proceed with caution sends it. The Deck pad's RB+Y chord skips that question in classical and
-teleop mode, so an arm left out should come home through the dashboard's buttons.
+teleop mode. In classical mode it refuses on the selfie path and during a selfie hold, and an arm left
+out should still come home through the dashboard's buttons.
 
 A new SBot session starts cold, and on base03 the cold start brings an arm on the selfie path home along
 it. An arm off the path behind the line stays where it is, and the dashboard says why. The dashboard's
