@@ -1,0 +1,15 @@
+# Copy to station.toml, which git ignores, and fill in this station's values.
+
+[camera]
+# The camera's own USB Wi-Fi adapter (USB 0e8d:7612), as `ip link` names it.
+wifi_interface = ""
+# The NetworkManager profile that joins the camera's Wi-Fi: nmcli -g connection.uuid connection show <name>
+nm_profile_uuid = ""
+# The six characters after "X5 " in the camera's Bluetooth and Wi-Fi names.
+serial = ""
+# The camera's address on its own Wi-Fi, where its OSC API answers.
+ip = ""
+
+[email]
+# The Gmail account that sends photos; its app password goes in GMAIL_APP_PASSWORD.
+sender = ""

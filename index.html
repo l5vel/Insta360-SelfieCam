@@ -3,15 +3,28 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Insta360 X5 Selfie Station</title>
+    <title>S-Bot Selfie Station</title>
     <style>
-        /* --- RESETS & GLOBAL LAYOUT --- */
+        /* --- VARIABLES & RESETS --- */
+        :root {
+            --primary: #002D72;
+            --primary-hover: #001f52;
+            --bg-color: #f4f7f6;
+            --text-main: #333333;
+            --text-light: #555555;
+            --border-color: #e0e0e0;
+            --success: #28a745;
+            --error: #dc3545;
+            --working: #0056b3;
+            --overlay: rgba(0, 0, 0, 0.4);
+        }
+
         *, *::before, *::after { box-sizing: border-box; }
-        
+
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #f4f7f6;
-            color: #333333;
+            background: var(--bg-color);
+            color: var(--text-main);
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -19,15 +32,16 @@
             margin: 0;
         }
 
+        .hidden { display: none !important; }
+
         /* --- GLOBAL HEADER --- */
         .global-header {
-            background-color: #002D72;
+            background-color: var(--primary);
             width: 100%;
             display: flex;
             justify-content: center;
             box-shadow: 0 2px 4px rgba(0,0,0,0.15);
             z-index: 100;
-
         }
 
         .header-inner {
@@ -97,7 +111,7 @@
             border-radius: 8px;
             box-shadow: 0 4px 12px rgba(0,0,0,0.1);
             width: 100%;
-            border-top: 6px solid #002D72;
+            border-top: 6px solid var(--primary);
             flex: 1;
             display: flex;
             flex-direction: column;
@@ -112,19 +126,18 @@
         }
         @media (min-width: 800px) {
             .app-layout {
-                grid-template-columns: 350px 1fr; 
+                grid-template-columns: 350px 1fr;
                 align-items: stretch;
             }
             .global-header {
-                position: -webkit-sticky; 
                 position: sticky;
                 top: 0;
             }
         }
         @media (min-width: 1200px) {
             .app-layout {
-                grid-template-columns: 1fr 3fr; 
-                gap: 3rem; 
+                grid-template-columns: 1fr 3fr;
+                gap: 3rem;
             }
         }
 
@@ -135,13 +148,9 @@
             align-items: center;
             margin-bottom: 2rem;
         }
-        .top-header .header-logo { 
-            max-width: 270px; 
-            margin-bottom: 0.5rem; 
-        }
-        .top-header h1 { 
-            margin: 0; 
-            color: #002D72; 
+        .top-header h1 {
+            margin: 0;
+            color: var(--primary);
             font-size: 1.8rem;
             text-align: center;
         }
@@ -154,8 +163,90 @@
 
         .step-section {
             margin-bottom: 1.5rem;
-            padding-bottom: 0.5rem;
-            border-bottom: 1px solid #e0e0e0;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .step-section:last-child {
+            border-bottom: none;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 10px;
+        }
+
+        /* --- UI ELEMENTS --- */
+        input[type="email"], button {
+            width: 100%;
+            font-size: clamp(0.875rem, 0.5rem + 1vw, 1.25rem);
+            padding: clamp(12px, 1vh + 4px, 18px);
+            border-radius: 4px;
+            margin-bottom: 1rem;
+        }
+
+        input[type="email"] {
+            border: 1px solid var(--border-color);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        input[type="email"]:focus {
+            border-color: var(--primary);
+            outline: none;
+            box-shadow: 0 0 0 2px rgba(0,45,114,0.2);
+        }
+
+        button {
+            background: var(--primary);
+            color: #ffffff;
+            border: none;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover { background: var(--primary-hover); }
+        button:disabled { background: #cccccc; color: #666666; cursor: not-allowed; }
+
+        #btn-disconnect { background: var(--error); }
+        #btn-disconnect:hover { background: #c82333; }
+        #btn-retake { background: #6c757d; margin-top: 1rem; }
+        #btn-retake:hover { background: #5a6268; }
+
+        .status {
+            font-size: 0.9rem;
+            font-weight: 500;
+            min-height: 1.2rem;
+            margin-bottom: 0.5rem;
+            text-align: center;
+        }
+        .status.success { color: var(--success); }
+        .status.error { color: var(--error); }
+        .status.working { color: var(--working); }
+
+        #download-link {
+            display: block;
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--working);
+            text-decoration: none;
+            margin-top: 1rem;
+            text-align: center;
+        }
+        #download-link:hover { text-decoration: underline; }
+
+        .progress-container {
+            width: 100%;
+            margin: 0.5rem 0;
+            background: var(--border-color);
+            border-radius: 4px;
+            overflow: hidden;
+            height: 6px;
+        }
+        #progress-bar {
+            width: 0%;
+            height: 100%;
+            background: var(--primary);
+            transition: none;
         }
 
         /* --- MAIN MEDIA VIEW --- */
@@ -167,118 +258,87 @@
             width: 100%;
         }
 
-        #placeholderText, #streamSection, #imageContainer {
+        .media-container {
             width: 100%;
-            max-width: 90vh; /* Bounds horizontal stretch on massive screens */
+            aspect-ratio: 4/3;
+            max-height: 75vh;
+            background: #ebf0f5;
+            border-radius: 8px;
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
             position: relative;
+            overflow: hidden;
+            border: 1px solid var(--border-color);
         }
 
-        #placeholderText {
-            background: #ebf0f5; 
-            border-radius: 8px;
-            aspect-ratio: 1.33 / 1; 
-            padding: 1rem; 
-        }
-
-        #liveStream, #resultImage {
-            width: 100%;
-            height: auto;
-            max-height: 75vh; 
-            object-fit: contain; 
-            border-radius: 4px;
-            border: 0px solid #002D72;
+        .media-container.dark {
             background: #000;
         }
-        #resultImage { border: 1px solid #cccccc; }
 
-        /* --- UI ELEMENTS --- */
-        input[type="email"], button {
-            width: 100%;
-            font-size: clamp(0.875rem, 0.5rem + 1vw, 1.25rem); 
-            padding: clamp(12px, 1vh + 4px, 18px);
-            border-radius: 4px;
-            margin-bottom: 1rem;
-        }
-
-        input[type="email"] {
-            width: 100%;
-            /* Lowered the minimum and maximum font sizes */
-            font-size: clamp(0.75rem, 0.4rem + 0.8vw, 1rem); 
-            padding: clamp(12px, 1vh + 4px, 18px);
-            border-radius: 4px;
-            margin-bottom: 1rem;
-            border: 1px solid #cccccc;
-            
-            /* Forces overflowing text to become '...' */
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        input[type="email"]:focus { 
-            border-color: #002D72; 
-            outline: none; 
-            box-shadow: 0 0 0 2px rgba(0,45,114,0.2);
-        }
-        
-        button {
-            background: #002D72;
-            color: #ffffff;
-            border: none;
-            font-weight: bold;
-            cursor: pointer;
-            transition: background 0.2s;
-            margin-bottom: 0.5rem;
-        }
-        button:hover { background: #001f52; }
-        button:disabled { background: #cccccc; color: #666666; cursor: not-allowed; }
-        
-        #disconnectBtn { background: #dc3545; }
-        #disconnectBtn:hover { background: #c82333; }
-        #retakeBtn { background: #6c757d; margin-top: 1rem; }
-        #retakeBtn:hover { background: #5a6268; }
-        
-        .status { 
-            font-size: 0.9rem; 
-            font-weight: 500; 
-            min-height: 1.2rem; 
-            margin-bottom: 0.5rem; 
-            text-align: center; 
-        }
-        .status.success { color: #28a745; }
-        .status.error { color: #dc3545; }
-        .status.working { color: #0056b3; }
-
-        #downloadLink {
-            display: block;
-            font-size: 0.9rem;
-            font-weight: 500;
-            color: #0056b3;
-            text-decoration: none;
-            margin-top: 1rem;
+        .placeholder-content {
+            color: #888;
             text-align: center;
         }
-        #downloadLink:hover { text-decoration: underline; }
+        .placeholder-content svg {
+            opacity: 0.5;
+            margin-bottom: 10px;
+        }
+        .loading-wheel {
+            width: 56px;
+            height: 56px;
+            border: 6px solid rgba(0, 45, 114, 0.18);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .loading-wheel { animation-duration: 1.8s; }
+        }
 
-        /* --- OVERLAY --- */
-        #countdownOverlay {
-            display: none; 
-            position: absolute; 
-            top: 0; left: 0; 
-            width: 100%; height: 100%; 
-            background: rgba(0, 0, 0, 0.4); 
-            color: #ffffff; 
-            font-size: 6rem; 
-            font-weight: bold; 
-            justify-content: center; 
-            align-items: center; 
-            border-radius: 4px;
-            z-index: 10;
+        #live-stream, #result-image {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        /* --- OVERLAYS --- */
+        .overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
             pointer-events: none;
+            z-index: 10;
+        }
+
+        #countdown-overlay {
+            background: var(--overlay);
+            color: #ffffff;
+            font-size: 6rem;
+            font-weight: bold;
+            border-radius: 4px;
+        }
+
+        #flash-overlay {
+            background: #ffffff;
+            opacity: 0;
+            transition: opacity 0.1s ease-out;
+        }
+        #flash-overlay.active {
+            opacity: 1;
+        }
+
+        .loading-text {
+            color: var(--text-light);
+            font-weight: 600;
+            font-size: 1.2rem;
+            position: absolute;
         }
     </style>
 </head>
@@ -287,7 +347,6 @@
 <header class="global-header">
     <div class="header-inner">
         <img src="static/utulsaIRA.jpg" alt="University of Tulsa Logo" class="nav-logo">
-        
         <nav class="nav-links">
             <a href="https://utulsa.edu/research/robotics-institute" target="_blank">Institute for Robotics & Autonomy</a>
             <a href="https://l5vel.com" target="_blank">L5vel</a>
@@ -296,307 +355,496 @@
 </header>
 
 <main class="content">
-<div class="container">
-    
-    <div class="top-header">
-        <h1>S-Bot Selfie Station</h1>
-    </div>
+    <div class="container">
 
-    <div class="app-layout">
-        
-        <div class="sidebar">
-            <div class="step-section" id="connectSection">
-                <button id="connectBtn" onclick="connectCamera()">1. Connect to Camera</button>
-                <div id="progressContainer" style="display: none; width: 100%; margin-bottom: 0.5rem; margin-top: 0.5rem;">
-                    <div style="width: 100%; background: #e0e0e0; border-radius: 4px; overflow: hidden; height: 6px;">
-                        <div id="progressBar" style="width: 0%; height: 100%; background: #002D72; transition: width 0.3s ease;"></div>
+        <div class="top-header">
+            <h1>S-Bot Selfie Station</h1>
+        </div>
+
+        <div class="app-layout">
+
+            <!-- CONTROLS SIDEBAR -->
+            <div class="sidebar">
+
+                <!-- Connect Section -->
+                <div class="step-section view-component" id="view-connect">
+                    <button id="btn-connect">Connect to Camera</button>
+                    <div id="progress-wrapper" class="progress-container hidden">
+                        <div id="progress-bar"></div>
+                    </div>
+                    <div id="status-connect" class="status" aria-live="polite"></div>
+                </div>
+
+                <!-- Capture Section -->
+                <div class="step-section view-component hidden" id="view-capture">
+                    <button id="btn-capture">Take Picture</button>
+                    <button id="btn-disconnect">Disconnect</button>
+                    <div id="status-capture" class="status" aria-live="polite"></div>
+                </div>
+
+                <!-- Email Section -->
+                <div class="step-section view-component hidden" id="view-email">
+                    <form id="email-form">
+                        <input type="email" id="input-email" placeholder="Enter email to receive photo" required>
+                        <button type="submit" id="btn-email">Send via Email</button>
+                    </form>
+                    <div id="status-email" class="status" aria-live="polite"></div>
+
+                    <a id="download-link" download="selfie.jpg" href="#">Download Photo to Device</a>
+                    <button id="btn-retake">Retake Photo</button>
+                </div>
+            </div>
+
+            <!-- MAIN MEDIA DISPLAY -->
+            <div class="main-view">
+
+                <!-- Placeholder -->
+                <div id="media-placeholder" class="media-container view-component">
+                    <div class="placeholder-content">
+                        <svg id="placeholder-icon" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
+                            <circle cx="12" cy="13" r="4"></circle>
+                        </svg>
+                        <p id="placeholder-msg">Connect to the camera to begin</p>
+                        <div id="placeholder-spinner" class="loading-wheel hidden" role="status" aria-label="Connecting to camera"></div>
                     </div>
                 </div>
-                <div id="connectStatus" class="status"></div>
-            </div>
 
-            <div class="step-section" id="captureSection" style="border-bottom: none;">
-                <div style="display: flex; gap: 10px;">
-                    <button id="captureBtn" onclick="takeSelfie()" disabled>2. Take Picture</button>
-                    <button id="disconnectBtn" onclick="manualDisconnect()" style="display: none;">Disconnect</button>
+                <!-- Live Stream -->
+                <div id="media-stream" class="media-container dark view-component hidden">
+                    <div id="countdown-overlay" class="overlay hidden"></div>
+                    <div id="flash-overlay" class="overlay hidden"></div>
+                    <div id="stream-loading" class="loading-text">Loading live feed...</div>
+                    <img id="live-stream" class="hidden" alt="Camera Live Feed">
                 </div>
-                <div id="captureStatus" class="status"></div>
-            </div>
-            
-            <div id="emailSection" style="display: none; margin-top: 0.5rem; padding-top: 1.5rem; border-top: 1px solid #e0e0e0;">
-                <input type="email" id="emailInput" placeholder="Enter email to receive photo">
-                <button id="emailBtn" onclick="sendEmail()">Send via Email</button>
-                <div id="emailStatus" class="status"></div>
-                
-                <a id="downloadLink" download="selfie.jpg" href="#">Download Photo to Device</a>
-                <button id="retakeBtn" onclick="retakeSelfie()">Retake Photo</button>
+
+                <!-- Captured Result -->
+                <div id="media-result" class="media-container dark view-component hidden">
+                    <img id="result-image" alt="Your captured selfie">
+                </div>
+
             </div>
         </div>
-
-        <div class="main-view">
-            <div id="placeholderText" style="color: #888; text-align: center;">
-                <svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="opacity: 0.5; margin-bottom: 10px;"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg>
-                <p>Connect to the camera to begin</p>
-            </div>
-
-            <div id="streamSection" style="display: none;">
-                <div id="countdownOverlay"></div>
-                <div id="streamLoadingText" style="position: absolute; color: #555; font-weight: 600; font-size: 1.2rem;">
-                    Loading live feed...
-                </div>
-                <img id="liveStream" alt="Camera Live Feed" style="display: none;" 
-                     onload="document.getElementById('streamLoadingText').style.display='none'; this.style.display='block';">            </div>
-
-            <div id="imageContainer" style="display: none;">
-                <img id="resultImage" alt="Your captured selfie">
-            </div>
-        </div>
-
     </div>
-</div>
 </main>
 
 <script>
-    let currentImagePath = '';
-    let currentFileName = '';
-    let connectionTimeout;
-    const IDLE_TIMEOUT_MS = 180000;
+    // --- STATE MANAGEMENT ---
+    const STATE = {
+        currentImagePath: '',
+        view: 'IDLE',
+        armBusy: false,
+        progressFrame: null,
+        idleTimer: null,
+        idleTimeoutMs: 120000, // 2 minutes
+        lastActivityPing: 0,
+        // Camera operations use sequential polling to avoid overlapping requests.
+    };
 
-    function setStatus(elementId, message, state = 'working') {
-        const el = document.getElementById(elementId);
-        el.innerText = message;
-        el.className = `status ${state}`;
+    const VIEWS = {
+        IDLE: ['view-connect', 'media-placeholder'],
+        STREAMING: ['view-capture', 'media-stream'],
+        RESULT: ['view-capture', 'view-email', 'media-result']
+    };
+
+    // --- DOM ELEMENTS ---
+    const DOM = {
+        views: document.querySelectorAll('.view-component'),
+        btns: {
+            connect: document.getElementById('btn-connect'),
+            capture: document.getElementById('btn-capture'),
+            disconnect: document.getElementById('btn-disconnect'),
+            email: document.getElementById('btn-email'),
+            retake: document.getElementById('btn-retake')
+        },
+        status: {
+            connect: document.getElementById('status-connect'),
+            capture: document.getElementById('status-capture'),
+            email: document.getElementById('status-email')
+        },
+        progress: {
+            wrapper: document.getElementById('progress-wrapper'),
+            bar: document.getElementById('progress-bar')
+        },
+        media: {
+            stream: document.getElementById('live-stream'),
+            result: document.getElementById('result-image'),
+            loading: document.getElementById('stream-loading'),
+            placeholder: document.getElementById('media-placeholder'),
+            placeholderIcon: document.getElementById('placeholder-icon'),
+            placeholderMsg: document.getElementById('placeholder-msg')
+        },
+        overlays: {
+            countdown: document.getElementById('countdown-overlay'),
+            flash: document.getElementById('flash-overlay')
+        },
+        forms: {
+            email: document.getElementById('email-form'),
+            emailInput: document.getElementById('input-email')
+        },
+        download: document.getElementById('download-link')
+    };
+
+    // --- EVENT LISTENERS ---
+    document.addEventListener('DOMContentLoaded', () => {
+        DOM.btns.connect.addEventListener('click', connectCamera);
+        DOM.btns.capture.addEventListener('click', takeSelfie);
+        DOM.btns.disconnect.addEventListener('click', () => executeDisconnect(true));
+        DOM.btns.retake.addEventListener('click', retakeSelfie);
+        DOM.forms.email.addEventListener('submit', handleEmailSubmit);
+        DOM.media.stream.addEventListener('load', handleStreamLoaded);
+
+        // Reset idle timer on keyboard interaction
+        DOM.forms.emailInput.addEventListener('input', resetIdleTimer);
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') syncWithApp();
+        });
+    });
+
+    // --- VIEW CONTROLLER ---
+    function setView(viewName) {
+        STATE.view = viewName;
+        DOM.views.forEach(el => el.classList.add('hidden'));
+        VIEWS[viewName].forEach(id => document.getElementById(id).classList.remove('hidden'));
+        syncArmControls();
     }
 
-    function startIdleTimer() {
-        clearTimeout(connectionTimeout);
-        connectionTimeout = setTimeout(() => {
-            setStatus('captureStatus', 'Session timed out. Disconnecting...', 'error');
-            executeDisconnect();
-        }, IDLE_TIMEOUT_MS);
+    function syncArmControls() {
+        DOM.btns.capture.disabled = STATE.armBusy || STATE.view !== 'STREAMING';
+        DOM.btns.disconnect.disabled = STATE.armBusy;
     }
 
-    function stopIdleTimer() {
-        clearTimeout(connectionTimeout);
+    function setStatus(target, message, state = 'working') {
+        DOM.status[target].textContent = message;
+        DOM.status[target].className = `status ${state}`;
     }
 
-    async function executeDisconnect(homeArm = false) {
-        stopIdleTimer();
-        
-        document.getElementById('streamSection').style.display = 'none';
-        document.getElementById('imageContainer').style.display = 'none';
-        document.getElementById('placeholderText').style.display = 'flex';
-        document.getElementById('liveStream').src = '';
-        
-        document.getElementById('captureBtn').disabled = true;
-        document.getElementById('disconnectBtn').style.display = 'none';
-        document.getElementById('emailSection').style.display = 'none';
-        document.getElementById('connectBtn').disabled = false;
+    function setConnectingPlaceholder(connecting) {
+        DOM.media.placeholderIcon.classList.toggle('hidden', connecting);
+        DOM.media.placeholderMsg.classList.toggle('hidden', connecting);
+        document.getElementById('placeholder-spinner').classList.toggle('hidden', !connecting);
+        DOM.media.placeholder.setAttribute('aria-busy', String(connecting));
+    }
 
+    // --- IDLE TIMER LOGIC ---
+    function resetIdleTimer() {
+        // Tells the app, at most every 15 s, that someone is still using the page.
+        if (Date.now() - STATE.lastActivityPing >= 15000) {
+            STATE.lastActivityPing = Date.now();
+            fetch('/activity', {method: 'POST', signal: AbortSignal.timeout(5000)})
+                .catch(err => console.warn('activity ping failed', err));
+        }
+        clearTimeout(STATE.idleTimer);
+        STATE.idleTimer = setTimeout(async () => {
+            if (await syncWithApp()) return;
+            setStatus('capture', 'No one has used the station for 2 minutes. Returning the arm home and disconnecting...', 'working');
+            executeDisconnect(true); // Ensure arm homes on timeout
+        }, STATE.idleTimeoutMs);
+    }
+
+    function clearIdleTimer() {
+        clearTimeout(STATE.idleTimer);
+    }
+
+    // Shows the app's own ending when it disconnected the station while this page's timers were stopped.
+    async function syncWithApp() {
+        if (STATE.view === 'IDLE' || STATE.armBusy) return false;
+        let data;
         try {
-            await fetch(`/disconnect?home_arm=${homeArm}`, { method: 'POST' });
-            setStatus('connectStatus', 'Disconnected from camera.', 'working');
-        } catch (err) {
-            console.error("Disconnect failed", err);
+            const res = await fetch('/status', {signal: AbortSignal.timeout(5000)});
+            if (!res.ok) return false;
+            data = await res.json();
+        } catch {
+            return false;
+        }
+        if (data.kind !== 'disconnect' || !data.done) return false;
+        clearIdleTimer();
+        ++connectionGeneration;
+        DOM.media.stream.src = '';
+        setConnectingPlaceholder(false);
+        DOM.media.placeholderMsg.textContent = 'Disconnected';
+        setView('IDLE');
+        setStatus('connect', data.message, 'success');
+        DOM.btns.connect.disabled = false;
+        return true;
+    }
+
+    // --- CORE WORKFLOW ---
+    let connectionGeneration = 0;
+
+    function showConnectProgress(data) {
+        setStatus('connect', data.message, data.stage === 'error' ? 'error' : 'working');
+    }
+
+    async function cameraOperation(path, generation, onProgress = showConnectProgress) {
+            const res = await fetch(path, {method: 'POST', signal: AbortSignal.timeout(10000)});
+            if (!res.ok) throw new Error(await res.text());
+            const {operation_id} = await res.json();
+            const deadline = Date.now() + 210000;  // a connect may wait on a Bluetooth wake
+
+            while (generation === connectionGeneration) {
+                const response = await fetch(`/status?operation_id=${encodeURIComponent(operation_id)}`,
+                    {signal: AbortSignal.timeout(5000)});
+                if (!response.ok) throw new Error(await response.text());
+                const data = await response.json();
+
+                if (generation !== connectionGeneration) return null;
+
+                onProgress(data);
+
+                if (data.done) {
+                    if (['error', 'cancelled'].includes(data.stage)) {
+                        const failure = new Error(data.message);
+                        failure.fromApp = data.stage === 'error';
+                        throw failure;
+                    }
+                    return data;
+                }
+                if (Date.now() > deadline) throw new Error('Camera operation timed out. Check server status.');
+                await new Promise(resolve => setTimeout(resolve, 400));
+            }
+            return null;
+    }
+
+    function startConnectionProgress() {
+        stopConnectionProgress();
+        const startedAt = performance.now();
+        const durationMs = 30000;
+
+        function advance(now) {
+            const progress = Math.min(100, (now - startedAt) / durationMs * 100);
+            DOM.progress.bar.style.width = `${progress}%`;
+            if (progress < 100) STATE.progressFrame = requestAnimationFrame(advance);
+            else STATE.progressFrame = null;
+        }
+
+        STATE.progressFrame = requestAnimationFrame(advance);
+    }
+
+    function stopConnectionProgress() {
+        if (STATE.progressFrame !== null) {
+            cancelAnimationFrame(STATE.progressFrame);
+            STATE.progressFrame = null;
         }
     }
 
-    function manualDisconnect() {
-        setStatus('captureStatus', 'Returning arm home and disconnecting...', 'working');
-        executeDisconnect(true);
+        async function connectCamera() {
+                const generation = ++connectionGeneration;
+                DOM.btns.connect.disabled = true;
+                setConnectingPlaceholder(true);
+
+                // Show and reset the progress bar
+                DOM.progress.wrapper.classList.remove('hidden');
+                DOM.progress.bar.style.width = '0%';
+                startConnectionProgress();
+
+                setStatus('connect', 'Checking camera connection...', 'working');
+
+                try {
+                    const operation = await cameraOperation('/connect', generation);
+                    if (!operation || generation !== connectionGeneration) return;
+
+                    stopConnectionProgress();
+                    DOM.progress.bar.style.width = '100%';
+                    setStatus('connect', operation.message, 'success');
+
+                    // Hide the progress bar cleanly after a 1-second delay
+                    setTimeout(() => {
+                        if (generation === connectionGeneration) DOM.progress.wrapper.classList.add('hidden');
+                    }, 1000);
+
+                    resetStreamFeed();
+                    setView('STREAMING');
+                    resetIdleTimer();
+
+                } catch (err) {
+                    if (generation !== connectionGeneration) return;
+                    stopConnectionProgress();
+                    setConnectingPlaceholder(false);
+                    // The app words its own failures for the person at the station; anything else gets the same plain line.
+                    setStatus('connect', err.fromApp ? err.message
+                        : "The camera isn't ready. Please try again in a minute, or ask for help.", 'error');
+                    DOM.btns.connect.disabled = false;
+                    DOM.progress.wrapper.classList.add('hidden'); // Hide on error
+                } finally {
+                    stopConnectionProgress();
+                }
+            }
+    async function executeDisconnect(homeArm = false) {
+        const generation = ++connectionGeneration;
+        clearIdleTimer();
+        STATE.armBusy = true;
+        DOM.media.stream.src = '';
+        setConnectingPlaceholder(false);
+        DOM.media.placeholderMsg.textContent = 'Disconnecting...';
+        setView('IDLE');
+        DOM.btns.connect.disabled = true;
+        setStatus('connect', 'Disconnecting camera...', 'working');
+        try {
+            const result = await cameraOperation(`/disconnect?home_arm=${homeArm}`, generation);
+            if (result && generation === connectionGeneration) {
+                DOM.media.placeholderMsg.textContent = 'Disconnected';
+                const armWarning = result.result?.warnings?.some(warning => warning.startsWith('Arm:'));
+                setStatus('connect', result.message, armWarning ? 'error' : 'success');
+            }
+        } catch (err) {
+            if (generation === connectionGeneration) setStatus('connect', parseError(err), 'error');
+        } finally {
+            if (generation === connectionGeneration) DOM.btns.connect.disabled = false;
+            STATE.armBusy = false;
+            syncArmControls();
+        }
     }
 
+    async function takeSelfie() {
+        if (STATE.view !== 'STREAMING') return;
+        clearIdleTimer();
+        STATE.armBusy = true;
+        syncArmControls();
+        let reconnected = false;
 
-    // Helper function for the giant visual countdown
+        try {
+            setStatus('capture', 'Moving arm into position...', 'working');
+            // Takes the arm from any other program without asking; the app logs why a move failed.
+            const armRes = await fetch('/position-arm?takeover=true', { method: 'POST' });
+            if (!armRes.ok) throw new Error("The arm isn't ready. Please try again in a minute, or ask for help.");
+
+            // A camera that stopped answering is reconnected here, before the countdown, with each stage on screen.
+            setStatus('capture', 'Checking the camera...', 'working');
+            const link = await cameraOperation('/connect?ensure=true', connectionGeneration, data => {
+                reconnected = reconnected || !['queued', 'checking', 'linked'].includes(data.stage);
+                setStatus('capture', data.message, data.stage === 'error' ? 'error' : 'working');
+                if (reconnected) showStreamMessage(data.message);
+            });
+            if (!link) return;
+            if (reconnected) {
+                resetStreamFeed();
+                await streamLoaded(10000);
+            }
+
+            setStatus('capture', 'Get Ready! 3...', 'working');
+            await runCountdown(3);
+
+            // Shutter effect & UI update
+            triggerFlash();
+            setStatus('capture', 'Processing photo...', 'working');
+
+            const res = await fetch('/capture', { method: 'POST' });
+            if (!res.ok) throw new Error(await res.text());
+
+            const data = await res.json();
+            STATE.currentImagePath = data.lan_path;
+
+            DOM.media.result.src = STATE.currentImagePath;
+            DOM.download.href = STATE.currentImagePath;
+
+            setView('RESULT');
+            setStatus('capture', 'Success!', 'success');
+
+        } catch (err) {
+            setStatus('capture', parseError(err), 'error');
+            if (reconnected) showStreamMessage(parseError(err));
+            DOM.overlays.countdown.classList.add('hidden');
+        } finally {
+            STATE.armBusy = false;
+            syncArmControls();
+            resetIdleTimer();
+        }
+    }
+
+    function retakeSelfie() {
+        setStatus('capture', '', 'working');
+        resetStreamFeed();
+        setView('STREAMING');
+        resetIdleTimer();
+    }
+
+    async function handleEmailSubmit(e) {
+        e.preventDefault();
+        resetIdleTimer();
+
+        const email = DOM.forms.emailInput.value.trim();
+        DOM.btns.email.disabled = true;
+        setStatus('email', 'Sending...', 'working');
+
+        try {
+            const res = await fetch(`/email?email=${encodeURIComponent(email)}&image=${encodeURIComponent(STATE.currentImagePath)}`, { method: 'POST' });
+            if (!res.ok) throw new Error(await res.text());
+
+            setStatus('email', 'Email sent successfully!', 'success');
+            DOM.forms.emailInput.value = '';
+        } catch (err) {
+            setStatus('email', parseError(err), 'error');
+        } finally {
+            DOM.btns.email.disabled = false;
+        }
+    }
+
+    // --- HELPER FUNCTIONS ---
     function runCountdown(seconds) {
         return new Promise((resolve) => {
-            const overlay = document.getElementById('countdownOverlay');
-            overlay.style.display = 'flex'; 
-            overlay.innerText = seconds;
+            DOM.overlays.countdown.classList.remove('hidden');
+            DOM.overlays.countdown.textContent = seconds;
 
             const interval = setInterval(() => {
                 seconds--;
                 if (seconds > 0) {
-                    overlay.innerText = seconds;
+                    DOM.overlays.countdown.textContent = seconds;
                 } else {
                     clearInterval(interval);
-                    overlay.style.display = 'none'; 
+                    DOM.overlays.countdown.classList.add('hidden');
                     resolve();
                 }
             }, 1000);
         });
     }
 
-    async function connectCamera() {
-        const btn = document.getElementById('connectBtn');
-        const captureBtn = document.getElementById('captureBtn');
-        const disconnectBtn = document.getElementById('disconnectBtn');
-        const progressContainer = document.getElementById('progressContainer');
-        const progressBar = document.getElementById('progressBar');
-        
-        btn.disabled = true;
-        progressContainer.style.display = 'block';
-        progressBar.style.width = '0%';
-        setStatus('connectStatus', 'Initializing wake sequence...', 'working');
-
-        // Start polling the backend for live percentage updates
-        const pollingInterval = setInterval(async () => {
-            try {
-                const res = await fetch('/status');
-                const data = await res.json();
-                setStatus('connectStatus', data.message, 'working');
-                progressBar.style.width = data.progress + '%';
-            } catch (err) {
-                // Ignore transient network errors during polling
-            }
-        }, 500);
-
-        try {
-            const res = await fetch('/connect', { method: 'POST' });
-            
-            // Stop polling once the main request finishes
-            clearInterval(pollingInterval);
-            
-            if (!res.ok) throw new Error(await res.text());
-            
-            progressBar.style.width = '100%';
-            setStatus('connectStatus', 'Connected to Camera!', 'success');
-            
-            // Hide the progress bar cleanly after a short delay
-            setTimeout(() => { progressContainer.style.display = 'none'; }, 1000);
-            
-            document.getElementById('placeholderText').style.display = 'none';
-            document.getElementById('streamSection').style.display = 'flex';
-            
-            document.getElementById('liveStream').style.display = 'none';
-            document.getElementById('streamLoadingText').style.display = 'block';
-            
-            document.getElementById('liveStream').src = '/stream?t=' + new Date().getTime();
-            
-            captureBtn.disabled = false;
-            disconnectBtn.style.display = 'block';
-            startIdleTimer(); 
-            
-        } catch (err) {
-            clearInterval(pollingInterval);
-            progressContainer.style.display = 'none';
-            
-            let errorMessage = err.message;
-            try {
-                const parsed = JSON.parse(err.message);
-                if (parsed.detail) errorMessage = parsed.detail;
-            } catch {}
-            setStatus('connectStatus', errorMessage, 'error');
-            btn.disabled = false;
-        }
+    function triggerFlash() {
+        DOM.overlays.flash.classList.remove('hidden');
+        DOM.overlays.flash.classList.add('active');
+        setTimeout(() => {
+            DOM.overlays.flash.classList.remove('active');
+            setTimeout(() => DOM.overlays.flash.classList.add('hidden'), 100);
+        }, 50);
     }
 
-    async function takeSelfie() {
-        stopIdleTimer(); 
-        
-        const btn = document.getElementById('captureBtn');
-        const disconnectBtn = document.getElementById('disconnectBtn');
-        const imgContainer = document.getElementById('imageContainer');
-        const streamSection = document.getElementById('streamSection');
-        const emailSection = document.getElementById('emailSection');
-        
-        btn.disabled = true;
-        disconnectBtn.disabled = true; 
-        imgContainer.style.display = 'none';
-        emailSection.style.display = 'none';
-        
-        setStatus('captureStatus', 'Moving arm into position...', 'working');
-
-        try {
-            const armRes = await fetch('/position-arm', { method: 'POST' });
-            if (!armRes.ok) throw new Error(await armRes.text());
-
-            setStatus('captureStatus', 'Get Ready! 3...', 'working');
-            await runCountdown(3);
-
-            streamSection.style.display = 'none';
-            document.getElementById('liveStream').src = '';
-            document.getElementById('placeholderText').style.display = 'flex';
-            document.getElementById('placeholderText').innerHTML = '<h1>Taking photo - Smile!</h1>';
-
-            setStatus('captureStatus', 'Processing photo...', 'working');
-            const res = await fetch('/capture', { method: 'POST' });
-            if (!res.ok) throw new Error(await res.text());
-            
-            const data = await res.json();
-            currentImagePath = data.url;
-            currentFileName = data.file_name;
-            
-            document.getElementById('placeholderText').style.display = 'none';
-            document.getElementById('resultImage').src = currentImagePath;
-            document.getElementById('downloadLink').href = currentImagePath;
-            document.getElementById('placeholderText').innerHTML = '<p>Camera Disconnected</p>';
-            
-            imgContainer.style.display = 'flex';
-            emailSection.style.display = 'block';
-            
-            setStatus('captureStatus', 'Success!', 'success');
-            
-            disconnectBtn.disabled = false;
-            startIdleTimer(); 
-            
-        } catch (err) {
-            let errorMessage = err.message;
-            try {
-                const parsed = JSON.parse(err.message);
-                if (parsed.detail) errorMessage = parsed.detail;
-            } catch {}
-            setStatus('captureStatus', errorMessage, 'error');
-            
-            document.getElementById('countdownOverlay').style.display = 'none';
-            btn.disabled = false;
-            disconnectBtn.disabled = false;
-        }
+    function resetStreamFeed() {
+        DOM.media.loading.textContent = 'Loading live feed...';
+        DOM.media.stream.classList.add('hidden');
+        DOM.media.loading.classList.remove('hidden');
+        DOM.media.stream.src = '/stream?t=' + Date.now();
     }
 
-    function retakeSelfie() {
-        document.getElementById('imageContainer').style.display = 'none';
-        document.getElementById('emailSection').style.display = 'none';
-        document.getElementById('captureStatus').innerText = '';
-
-        document.getElementById('streamSection').style.display = 'flex';
-        // Reset the loading state before requesting the new stream
-        document.getElementById('liveStream').style.display = 'none';
-        document.getElementById('streamLoadingText').style.display = 'block';
-        document.getElementById('liveStream').src = '/stream?t=' + new Date().getTime();
-
-        document.getElementById('captureBtn').disabled = false;
+    function showStreamMessage(message) {
+        DOM.media.stream.classList.add('hidden');
+        DOM.media.loading.textContent = message;
+        DOM.media.loading.classList.remove('hidden');
     }
 
-    async function sendEmail() {
-        const btn = document.getElementById('emailBtn');
-        const emailInput = document.getElementById('emailInput');
-        const email = emailInput.value.trim();
+    function streamLoaded(ms) {
+        return new Promise(resolve => {
+            const done = () => {
+                clearTimeout(timer);
+                DOM.media.stream.removeEventListener('load', done);
+                resolve();
+            };
+            const timer = setTimeout(done, ms);
+            DOM.media.stream.addEventListener('load', done);
+        });
+    }
 
-        if (!email) {
-            setStatus('emailStatus', 'Please enter a valid email.', 'error');
-            return;
-        }
+    function handleStreamLoaded() {
+        DOM.media.loading.classList.add('hidden');
+        DOM.media.stream.classList.remove('hidden');
+    }
 
-        btn.disabled = true;
-        setStatus('emailStatus', 'Sending...', 'working');
-
+    function parseError(err) {
+        let msg = err.message;
         try {
-            const res = await fetch(`/email?email=${encodeURIComponent(email)}&filename=${encodeURIComponent(currentFileName)}`, { method: 'POST' });
-            if (!res.ok) throw new Error(await res.text());
-
-            setStatus('emailStatus', 'Email sent successfully!', 'success');
-            emailInput.value = ''; 
-        } catch (err) {
-            let errorMessage = err.message;
-            try {
-                const parsed = JSON.parse(err.message);
-                if (parsed.detail) errorMessage = parsed.detail;
-            } catch {}
-            setStatus('emailStatus', errorMessage, 'error');
-        } finally {
-            btn.disabled = false;
-        }
+            const parsed = JSON.parse(err.message);
+            if (parsed.detail) msg = parsed.detail;
+        } catch {}
+        return msg;
     }
 </script>
 </body>

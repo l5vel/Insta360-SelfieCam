@@ -1,215 +1,538 @@
-# Insta360 SelfieCam
+# Selfie station
 
-A kiosk selfie booth: an Insta360 X5 on the end of an xArm, driven from a web page. A
-visitor opens the page, the arm moves to the selfie pose, the camera streams a de-warped
-live preview, and one press captures a photo, brands it and emails it to them.
+The selfie station poses the robot's arm with an Insta360 X5 camera, shows a live preview on a phone
+page and takes the picture. This FastAPI app serves that page on port 8000. It drives the arm through
+ArmBaseControl and reaches the camera over the camera's own Wi-Fi, through a USB Wi-Fi adapter kept for
+the camera alone.
 
-The camera is an access point at a fixed `192.168.42.1`, so the host joins the camera's
-Wi-Fi to talk to it — on a **dedicated USB dongle**, so the normal network stays up. The
-arm is shared with the rest of the robot stack through ArmBaseControl's lease.
+## Setup
 
----
+### Insta360 access
 
-## Pieces
+Apply for access to Insta360's SDK at https://www.insta360.com/sdk/apply. The app itself controls the
+camera through the camera's OSC HTTP API, and it takes the live preview through the client in the
+community `insta360` package.
 
-| file | what it is |
-|---|---|
-| `main.py` | The FastAPI app — every endpoint below, the RTMP pull, frame processing and email. |
-| `arm_control.py` | Arm poses and the ArmBaseControl lease integration. |
-| `insta360_daemon.py` | Standalone SRT re-streamer. Not used by the web app; its SSID and profile name are hardcoded. |
-| `index.html`, `static/` | The kiosk front end and its assets. |
-| `insta360.service`, `install_service.sh` | systemd unit and its installer. |
-| `tests/` | Lease release, API contract, capture retry. |
+### Installing
 
-## HTTP API
+The app drives the arm through its own ArmBaseControl checkout in `third_party/ArmBaseControl`, which
+git ignores. `pyproject.toml` installs it from there as an editable dependency with its `sparkflex` CAN
+stack. Check out the commit SBot pins, so the station and SBot's supervisor run the same arm code, and
+then install everything recorded in `uv.lock`:
 
-| method | path | does |
+```sh
+git clone git@github.com:l5vel/ArmBaseControl.git third_party/ArmBaseControl
+git -C third_party/ArmBaseControl checkout <commit>   # git -C <SBot> ls-tree HEAD third_party/ArmBaseControl
+uv sync --locked
+```
+
+ArmBaseControl picks its config file by hostname, and the arm's selfie path is `arm.selfie` in that file.
+Keep the `anker-solix-api` metadata block in `pyproject.toml`, because ArmBaseControl resolves here only
+with it.
+
+The project pins Python 3.11, and the shell's `python` may be another version, so run project commands
+through `uv run` or `.venv/bin/python`. To start the app by hand, run
+`uv run uvicorn main:app --host 0.0.0.0 --port 8000` in this directory. SRT output starts only when a
+client supplies a destination, and it needs the system's `ffmpeg` with `libx264` and SRT support. The
+page itself uses MJPEG.
+
+The app writes each photo to `static/latest.jpg`, so git ignores `static/`. Copy in the two images the
+station shows by hand: `static/logo.png`, an RGBA PNG the app puts on each photo's border when it is
+there, and `static/utulsaIRA.jpg` in the page's header.
+
+### This station's values
+
+`station.toml` holds what belongs to one station, and git ignores it. It names the camera adapter's
+interface, the camera profile's UUID, the camera's serial and address, and the Gmail account that sends
+photos. Copy `station.example.toml` to `station.toml` and fill it in. The serial is the six characters
+after "X5 " in the camera's Bluetooth name, and the app builds both the wake beacon and that name from it.
+
+While a camera value is missing, the app still starts and the arm still works. Connect, Take Picture and
+Resume stop with the station user's usual line and name the missing value in the detail. Disconnect
+still brings the arm home and says it left the Wi-Fi alone. Email needs `[email] sender` and
+`GMAIL_APP_PASSWORD`, and without either `/email` answers 503 and names what is missing.
+
+### The camera's network profile
+
+NetworkManager holds one profile for the camera, bound to the camera adapter and pinned to the camera's
+BSSID. The camera's SSID is its model and serial followed by `.OSC`. Leave the profile's channel unset,
+since the camera picks a channel each time its Wi-Fi starts. Autoconnect stays off, so NetworkManager
+joins the camera only when the app asks. The UUID and the adapter below are the ones in `station.toml`.
+
+```sh
+nmcli connection modify uuid <camera-profile-uuid> \
+  connection.interface-name <camera-adapter> connection.autoconnect no \
+  802-11-wireless.band a 802-11-wireless.channel "" \
+  802-11-wireless.powersave 2 ipv4.never-default yes ipv4.ignore-auto-dns yes \
+  ipv4.ignore-auto-routes yes ipv6.method disabled
+```
+
+### The adapter helper
+
+`scripts/selfie-camera-control` owns the camera's USB Wi-Fi adapter, a MediaTek MT7612U on base03's USB
+port 1-6, and nothing else. Install it, its sudo rule and its boot check with
+`sudo bash scripts/install-camera-helper.sh`. Until it is installed, Connect stops and names that command
+in the detail. The sudo rule lets base3 run `reset`, `scan` and `sweep` and nothing more. The installer
+also runs `isolate` once and sets the camera profile to take no default route, DNS server or DHCP route
+from the camera.
+
+The helper in this repository names no adapter and refuses every command. The installer reads the
+adapter's interface and the camera's address from `station.toml`, and it refuses an interface that the
+MT7612U did not create, so `wlp5s0` cannot be picked by mistake. It then installs a copy with both
+values written in, so root never reads a user-owned file at run time. Run the installer again after
+changing either value, because Connect stops and names the reinstall when the installed copy names a
+different adapter from `station.toml`.
+
+| command | runs as | what it does |
 |---|---|---|
-| `GET` | `/` | Serves `index.html`, re-read per request. |
-| `GET` | `/stream`, `/stream/equirec` | MJPEG of the cropped selfie view / full equirectangular frame. |
-| `GET` | `/status` | Camera state for the front end to poll. |
-| `POST` | `/connect` | Joins the camera's Wi-Fi and starts the RTMP pull. |
-| `POST` | `/position-arm` | Moves the arm to the selfie pose. |
-| `POST` | `/capture` | Fires `camera.takePicture` over OSC, downloads the full-res JPEG, brands it, writes it to `static/`. Returns `status`, `file_name`, `url`. |
-| `POST` | `/email?email=…&filename=…` | Emails a captured photo. Both params required. |
-| `POST` | `/disconnect` | Drops the camera link. `?home_arm=true` also sends the arm home. |
+| `check` | anyone | ready when the adapter is on the USB bus, authorized, bound to `mt76x2u`, has created its interface, and NetworkManager manages it; otherwise prints the first layer that failed |
+| `reset` | root | re-authorizes the adapter, reloads `mt76x2u`, port-resets the adapter if the reload brings no interface back, and hands it to NetworkManager |
+| `scan` | root | clears any wpa_supplicant scan restriction, then kernel-scans channels 36 to 48 and 149 to 165 and prints each network heard in that scan; waits up to 30 s for another scan on the adapter to finish |
+| `sweep` | root | the same over every channel the adapter supports |
+| `isolate` | root | adds an unreachable route for the camera's subnet at metric 4000, so camera traffic has no way out but the camera's adapter |
+| `boot` | root | at startup, runs `isolate`, then waits up to 30 s for the adapter and resets it up to twice |
+| `configure STATION_TOML` | anyone | prints this helper with the adapter and the camera's /24 subnet from `station.toml` written in; the installer installs that copy |
 
-## Running it
+`selfie-camera-adapter.service` runs `boot` once at startup, and `journalctl -u selfie-camera-adapter`
+shows its result. Nothing waits for it, so SBot and teleop start on their own schedule. The app runs
+`check` only when someone presses Connect, and SBot and teleop never run it.
 
-```bash
-./venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000   # directly
-./install_service.sh                                     # or as a service
-journalctl -u insta360 -f
+### Running as a service
+
+`selfie.service` in `/etc/systemd/system` runs this directory's `.venv` on port 8000 as base3. After a
+change to the code or the lock, run `uv sync --locked` here and then `sudo systemctl restart selfie`.
+Email needs `GMAIL_APP_PASSWORD` in the service's environment, for example through an `EnvironmentFile=`
+line that names a file kept at mode 600. Run one Uvicorn worker, because a process lease lets only one
+process own the camera.
+
+### Tests
+
+Run the hardware-free tests with:
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
-There is no `requirements.txt` — the venv is the only record of the dependencies and is not
-in git, so the environment cannot be rebuilt from the repo. Worth fixing with
-`./venv/bin/pip freeze > requirements.txt`.
+No test runs the real adapter helper, takes the real scan lock or reads `station.toml`. Every test
+module that loads `camera_connection` imports `tests/sandbox.py`, which points the helper and the lock at
+a temporary directory and gives the app made-up station values, and a test fails any module that skips
+it. These tests cover logic only and say nothing about hardware timing.
 
-## Configuration
+## How it works
 
-| env | meaning |
+### Taking a picture
+
+Connect to Camera posts `/connect`, and Disconnect posts `/disconnect`. Both return HTTP 202 with an
+`operation_id`, and the page polls `/status?operation_id=...` until `done` is true. The status carries
+the stages reached, any error, and monotonic stage timings. The preview counts as ready at its first
+decoded image. A capture is a synchronous request, queued behind any connect or disconnect in progress.
+
+Connect reuses an active camera link. Otherwise it checks the adapter through the helper and resets it
+once if it came up broken. It then scans the camera's channels with the helper and counts only networks
+heard during that scan. When the camera is absent, the app wakes it over Bluetooth. It sends the wake
+beacon for up to 60 s and then waits 20 s more, scanning every 3 s. The Bluetooth controller cannot
+watch for the camera while it sends the beacon, so the app checks Bluetooth once the beacon ends. If the
+camera advertises then, or its state cannot be read, the app sweeps every channel once before it gives
+up. It then activates the profile and waits up to 25 s for the link. The whole connect has a 200 s
+budget, and a preview error keeps the Wi-Fi up so the next Connect can retry the preview.
+
+Take Picture first sends the arm to the selfie pose with `/position-arm?takeover=true`. It then asks for
+`/connect?ensure=true`, which returns at once when the camera's API answers and leaves the preview
+alone. When the camera stays silent, it runs the whole connect to the preview's current destination, so
+a dashboard watching over SRT keeps its stream. Each stage shows in the page's status line and over the
+live feed. The countdown starts once the feed is back, and a failed reconnect shows its plain line in
+both places. NetworkManager joins the camera only when the app asks, so a camera whose Wi-Fi restarted
+between pictures needs this fresh connect. A capture from any other client gets "Camera is unreachable.
+Connect before capturing." when the camera does not answer.
+
+A capture first checks that the camera's API answers, waiting up to 2 s so one lost packet cannot fail
+it. It stops the preview stream on port 6666 while it runs. When the camera refuses the picture, the
+error carries the camera's own reply, such as its OSC error code, so the log says why. Each capture
+closes its HTTP connections to the camera when it ends, because a pooled connection can outlive the
+link. One stayed established for 26 minutes through a link loss and a Disconnect, and a later capture
+would have reused it and been reset.
+
+Every step of Connect and Take Picture moves on when a live check passes, and its number is only how
+long it waits before giving up with a message. The helper's scan must hear the camera, and the wake
+beacon stops the moment a scan every 3 s does. NetworkManager must report the link activated, the
+camera's API must answer a probe made every 0.5 s, and the preview must decode its first frame. A
+capture ends when the camera reports the picture done, polled every 0.4 s, and the file has downloaded.
+The arm moves block until the controller reports each one, and the pose guard reads the joint angles
+before the shutter. A few waits are fixed by design. These are the 3 s countdown, pauses of 0.2 to
+0.5 s between arm controller commands, the 0.5 s settle once the arm reaches its pose, and the 2-minute
+idle shutoff. The longest waits come from the helper waiting out NetworkManager's own scans, as
+"Scans on the camera adapter" describes.
+
+These times were measured on base03 with the X5, and each rests on one or two runs.
+
+| step | measured | runs |
+|---|---|---|
+| Connect with the camera awake and its Wi-Fi on, to preview ready | 21.5 s | 1 |
+| Connect with the camera asleep, to preview ready | 38.8 s and 61.7 s | 2 |
+| Take Picture reconnecting after the camera's Wi-Fi restarted | 26.5 s | 1 |
+| Capture, from the shutter to the downloaded file | 6.1 s and 6.2 s | 2 |
+| Pre-capture check finding a silent camera | 1 ms with the isolation route, 2 s without it | 1 each |
+| Idle shutoff firing after the last use, checked every 5 s | 122 s | 1 |
+| Idle shutoff bringing the arm home along the path | 12.1 s over three waypoint moves | 1 |
+
+In the awake connect, the adapter joined 1.1 s after NetworkManager began activating the profile. The
+DHCP lease came 0.4 s after the join, and the preview 1.5 s after the lease.
+
+### Sharing the arm
+
+The phone page takes the arm directly. Take Picture posts `/position-arm?takeover=true`, which asks
+whoever holds the arm lease to release it and waits up to 15 s. An SBot session answers by aborting its
+running task and letting a selfie hold go where the arm stands. It tells its dashboard that another
+program took the arm, then closes within its 8 s teardown. That report is lost when the session's status
+wire closes first. If the owner keeps the arm, the page shows its plain arm message and the journal names
+the owner.
+
+The dashboard asks for the arm the same way. When it connects while this app holds the arm, its takeover
+dialog names the selfie station and offers Take over and Cancel. Take over has this app bring the arm
+home along the `arm.selfie` path, then disconnect and release the lease. From the selfie pose the retrace
+should take about 10 s at the configured speed, which fits inside the 15 s the dashboard's supervisor
+waits. That figure is computed from the path and has not been measured. An arm the retrace cannot place
+on the path is released where it stands, and the journal logs why.
+
+### Deploying and bringing the arm home
+
+Importing `arm_control` leaves the robot alone until a request needs the arm. Deployment starts from the
+path's home and follows the joint waypoints in the robot config's `arm.selfie` block, which the SBot
+supervisor's `selfie_pose` verb follows too. While another process holds the arm lease, such as an SBot
+session that posed the arm for the dashboard, `/capture` leaves the pose to that owner. Return-home runs
+only after this process has deployed the arm, and it retraces the path from a verified waypoint. An arm
+found off the path goes home through the controller's own initial point, which the app reads from xArm
+Studio's API. An arm already at that point goes straight to the path's home. Deployment does the same
+before it sets out, so an arm that is home deploys even after a failed deployment. The arm's address
+comes from `SELFIE_ARM_IP`, with base03's `172.16.0.13` as the default.
+
+The app moves an arm off the path only while its TCP x is at least `arm.home_caution_x_mm` (50 mm on
+base03). Below that line the arm sits near the VLA cameras, and the app stops with "Arm needs a manual
+reset", giving the measured x. It stops the same way when it cannot read the position or the initial
+point. A stop on the path mid-deployment still asks for a return home first, since the path is the safe
+route back. Release enters xArm joint teaching mode only after the arm is home, then closes the
+connection and releases the ownership lease.
+
+Once a dashboard session has the arm, every way home it offers follows the selfie path's own waypoints.
+Return arm on the Insta360 page and ARM HOME both retrace the path while the robot holds the arm out.
+Settings' Go home from selfie starts from whichever waypoint the robot measures the arm at, works with or
+without a hold, and refuses from anywhere else. ARM HOME does the same for an arm on the path with no
+hold. The retrace starts only from a measured waypoint, because a straight move onto the wrong one can
+hit the VLA cameras.
+
+An arm off the path with its TCP x below `arm.home_caution_x_mm` sits behind the robot near those
+cameras. base03 sets the line at 50 mm, and only the selfie pose and the basket dropoff, which is not
+configured yet, take the arm behind it. From there ARM HOME asks the operator before a straight move, and
+only Proceed with caution sends it. The Deck pad's RB+Y chord skips that question in classical and
+teleop mode, so an arm left out should come home through the dashboard's buttons.
+
+A new SBot session starts cold, and on base03 the cold start brings an arm on the selfie path home along
+it. An arm off the path behind the line stays where it is, and the dashboard says why. The dashboard's
+ways home and the cold start share ArmBaseControl's `arm/selfie_path.py`, while this app's own return
+keeps its copy in `arm_control.py`. These checks have run only in tests and in SBot's verb probe so far.
+
+The station also brings the arm home by itself. After a picture, or when a session stops partway, it
+disconnects the camera and homes the arm once no one has used it for 2 minutes. The page's timer stops
+when a phone locks or the tab closes, so the app keeps a clock of its own. Every POST to the app counts
+as use, and the page posts `/activity` at most every 15 s while someone acts on it. Status polls leave
+the clock alone. The app acts when its clock reaches 2 minutes with the arm out and no camera work
+running. It disconnects the camera, retraces the selfie path home along its poses as Disconnect does,
+and releases the arm. It logs a warning, and `/status` then reads "Camera disconnected by the 2-minute
+idle shutoff."
+
+When the phone wakes, or the page's own timer fires late, the page asks the app first. A station the app
+already shut off returns to the Connect view with the app's message, and the page sends no second
+disconnect. A Disconnect that finds the camera link already down finishes quietly, without
+NetworkManager's "not an active connection" warning. An explicit Disconnect takes the camera's Wi-Fi link
+down, while shutting the app down stops the preview, releases the process lease and leaves the link up.
+
+### Logs
+
+The app logs to the journal, and `journalctl -u selfie` reads it. Every connect, disconnect and capture
+logs the client that asked for it and each stage it passes. A disconnect that cuts another client's
+connect short logs a warning naming the sender, and the cancelled operation's message in `/status` names
+it too.
+
+While a connection is up, the app checks the link every 3 s. It logs one warning when the adapter leaves
+the USB bus, the Wi-Fi goes down, the camera stops answering or the preview stalls, and one line when the
+link recovers. `/status` carries the current reason in its `link` field, and the reason an operation
+failed in its `detail` field. Successful polls of `/status` and the preview streams stay out of the
+access log, because clients poll them twice a second.
+
+A camera whose Wi-Fi goes off leaves a clear trail. In one recorded loss, the recorder flagged the
+silence 0.65 s after the camera's last beacon, and the kernel reported beacon loss at 1.3 s. The adapter
+disconnected itself for inactivity at 2.5 s, and the app logged the link loss at 2.0 s. NetworkManager
+gave up about 17 s after the last beacon with `ssid-not-found`. The arm SDK can log `[Errno 32] Broken pipe` while
+the arm is released, and the release still completes. That line appeared once in 14 logged releases.
+
+### Scans on the camera adapter
+
+Every scan request on the adapter, from the app, the helper or a test script, holds
+`/run/lock/selfie-camera-scan.lock`, so none of them overlap. NetworkManager's own background scans
+cannot take the lock, and the helper's scan waits for them to finish. NetworkManager scans the adapter
+every 120 to 121 s while idle, and back to back for about three minutes after any disconnect, a user's or
+a lost link's. Each of its scans asks for 39 channels across both bands, and once scans can finish, each
+runs 21 to 22 s. A helper scan asked for in that window waits up to 30 s for the scan in progress. In
+three connects the helper waited 7, 16 and 21 s before its first scan. In one of them the camera sat in
+the adapter's scan cache for about 13 s before the app heard it.
+
+When the helper's 30 s wait runs out, the connect ends with "The camera Wi-Fi was busy. Please try
+again." for the station user, and the helper's reason goes in the detail. The app accepts these waits
+and leaves the kernel's scan handling alone. A busy adapter ends the connect with that prompt, since the
+two connects that fell back to NetworkManager's 39-channel scans took 77 s and 173 s, and the second
+failed. A helper that cannot run for any other reason still falls back to them.
+
+The app scans through the helper because NetworkManager's rescans proved unreliable on this adapter. A
+rescan asked for soon after another scan came back without a new scan, and one asked for during
+NetworkManager's own scan was answered by that older scan. A kernel scan waits for any scan in progress
+and then runs its own.
+
+### Camera traffic stays on the camera's adapter
+
+While the camera link is up, its own route at NetworkManager's metric of 600 outranks the unreachable one
+from `isolate`. While it is down, anything sent to the camera fails at once, where it would otherwise
+leave through base03's own Wi-Fi, wlp5s0, and wait out its timeout. Once the helper is installed,
+`ip route show type unreachable` lists the route, and `ip route get <camera-ip>` answers "No route to
+host" while the camera is disconnected.
+
+The wake beacon and the awake check are the one piece still shared with base03's own Wi-Fi. They use the
+onboard Bluetooth on the MediaTek MT7922 chip that also carries wlp5s0, and a separate USB Bluetooth
+adapter would move them off it.
+
+### Waking the camera
+
+The app sends the wake beacon through BlueZ's advertising interface with `bluetoothctl`, which needs no
+root, and bluetoothd confirms the beacon on the air. `btmgmt` 5.72 hangs after every command, even
+`--version`, so nothing here uses it. A sleeping camera stays silent on Bluetooth, but it listens for the
+beacon.
+
+Every station connect that found the camera asleep woke it with its Wi-Fi, ten times out of ten. The
+table lists each wake by how long the camera had gone unseen before the beacon, taken from the app's
+journal. The second column is when the app's scans first heard the camera's Wi-Fi, counted from the
+start of the beacon.
+
+| camera last seen awake | Wi-Fi heard |
 |---|---|
-| `GMAIL_USERNAME` | Sending account. |
-| `GMAIL_APP_PASSWORD` | Google **app password**. No default; `/email` fails without it. |
-| `CAMERA_SSID`, `CAMERA_SSID_PATTERN` | Preferred SSID, and the fallback regex (`\.OSC$`). |
-| `WIFI_INTERFACE`, `WIFI_PROFILE_NAME` | Dongle and NetworkManager profile. |
-| `CAPTURE_POLL_ATTEMPTS`, `CAPTURE_DOWNLOAD_RETRIES` | Capture patience knobs. |
+| about 3.5 h before | 52 s |
+| about 100 min before | 23 s |
+| about 48 min before | 21 s |
+| 14.7 min before | 73 s |
+| 10.8 min before | 42 s |
+| 8.1 min before | 20 s |
+| 7.6 min before | 61 s |
+| 3.1 min before | 28 s |
+| 2.8 min before | 51 s |
+| 2.3 min before | 30 s |
 
-**Do not put the app password in `insta360.service`** — that file is committed. Use
-`sudo systemctl edit insta360` and set it in the drop-in, which is not in git.
+The camera's Wi-Fi starts sooner than the app hears it. In three wakes the recorder captured, it came
+up 11.3 s and 12.5 s after the beacon started when the camera had slept for minutes or about 48 min,
+and 41.2 s after it had slept about 3.5 h. The rest of each gap is scan timing. The first helper scan
+that starts after the Wi-Fi does hears the camera, and in the two shorter wakes those scans also waited
+behind NetworkManager's. The wake gives the camera 80 s, the 60 s beacon plus 20 s of scans, so a longer
+sleep eats into that margin.
 
-## The Wi-Fi hop
+A beacon sent while the camera is awake with its Wi-Fi timed out does nothing,
+as one connect showed, and "Known failures" covers that case.
 
-`find_camera_ssid()` picks the camera out of an `nmcli` scan by the `.OSC` suffix rather
-than an exact name, because the X5 advertises as `<model> <serial>.OSC`, sometimes with an
-`Insta360` prefix and sometimes serial-only. `sync_profile_ssid()` then repoints the saved
-profile, so a rename — or a different X5 — still works without creating a second profile.
+### The camera's own timers and settings
 
-### Pinning the camera to its own radio
+The camera turns its Wi-Fi off 2 minutes after its preview connection closes. That was measured twice to
+the second, and two more gaps of the same length match it. A capture closes that connection, and the
+Wi-Fi goes off even while the robot's adapter stays joined. Left alone, the camera falls asleep two to
+four minutes after waking.
 
-Two radios: `wlp5s0` (internal, normal network) and `wlx9cefd5f89420` (MT7612U dongle,
-camera only). NetworkManager does not respect that split by default — it will autoconnect
-any saved profile on either radio, and it did: a duplicate `level5_` profile grabbed the
-dongle and became the host's default route and DNS.
+The camera's menu shows firmware 1.11.6 with MCU 1.2.5 on hardware 620. Auto Power Off is set to 3
+minutes, Bluetooth Wakeup is on, and touch to wake the screen is off. The 3 minutes fit the camera
+falling asleep two to four minutes after waking. The menu has no Wi-Fi mode setting such as Auto or
+Always On, so the camera keeps its fixed Wi-Fi idle timeout. Over the camera's protocol, its Bluetooth
+wake switch (`BT_WAKEUP_SW`) reads On and `STANDBY_DURATION` reads 0. That 0 matches no menu setting, so
+the field is some other setting or its 0 means something the protocol leaves unstated.
 
-```bash
-# camera profile -> the dongle only, and never the default route
-sudo nmcli connection modify Insta360 \
-  connection.interface-name wlx9cefd5f89420 \
-  802-11-wireless.mac-address 9C:EF:D5:F8:94:20 \
-  connection.autoconnect yes connection.autoconnect-priority 100 \
-  ipv4.never-default yes ipv6.never-default yes
+The app assumes the camera's Wi-Fi is always on 5 GHz. The profile's band is `a` and the helper's scan
+covers only 5 GHz channels, so a camera switched to 2.4 GHz would be neither found nor joined. The
+camera's region is set to America, so it picks a channel from 36 to 48 or 149 to 165 each time its Wi-Fi
+starts. The logs show 36, 48 and 149, and the one sweep covers any other channel.
 
-# every other wifi profile -> the internal radio only
-sudo nmcli connection modify <name> connection.interface-name wlp5s0
-```
+### Recording the camera link
 
-`ipv4.never-default` is the one that matters: without it the camera link installs a default
-route, and if its metric wins the host tries to reach the internet through a 360 camera.
-
-### Two traps
-
-**Profiles are owned by netplan.** `/etc/NetworkManager/system-connections/` is empty here
-— that is normal, not a missing file. Profiles live in `/etc/netplan/90-NM-<uuid>.yaml` and
-are generated into `/run/NetworkManager/system-connections/`. `nmcli connection modify`
-writes back through netplan and does persist.
-
-**Never touch this adapter from GNOME Settings.** `gnome-control-center` deleted the
-`Insta360` profile twice in one session. Each delete discards the pinning, and GNOME stores
-the password in the *user keyring* rather than the profile — which a headless service can
-never read, so auth then fails forever. Keep the PSK in the profile:
-
-```bash
-sudo nmcli connection modify Insta360 \
-  802-11-wireless-security.psk '<camera password>' \
-  802-11-wireless-security.psk-flags 0
-```
-
-## Sharing the arm with teleop
-
-The arm is held under ArmBaseControl's lease. Two things follow, both deliberate:
-
-- **The lease is released when the camera session ends.** `arm_release()` calls
-  `disconnect()`, the only path reaching `ResourceLease.release()`. Without it the process
-  held the lease from the first `/position-arm` until it died, and every teleop takeover
-  ended in SIGKILL plus a systemd restart.
-- **A takeover hook is registered at import**, so the cooperative wait succeeds. It does
-  **not** home the arm — the requester adopts it where it stands, and homing would blow the
-  15 s window and get the process killed anyway.
-
-Registration is guarded, so an older ArmBaseControl without `on_takeover` cannot stop the
-service booting.
-
-## Troubleshooting
-
-### `/connect` → 504 "SSID not found"
-
-The scan genuinely did not see the camera. Check whether the AP is on air before touching
-the host:
-
-```bash
-sudo nmcli device wifi rescan ifname wlx9cefd5f89420
-sleep 12          # scans take ~11s on this adapter
-nmcli -t -f SSID,SIGNAL,CHAN dev wifi list ifname wlx9cefd5f89420 --rescan no | grep -i OSC
-```
-
-Other APs listed but no camera means the fault is the camera: flat battery, Wi-Fi off,
-asleep, or mid-reboot.
-
-`nmcli device wifi rescan` **returns immediately** — it requests a scan, it does not wait
-for one, and a full scan here takes ~11 s. Listing a second later just re-reads the previous
-scan's cache. `/connect` uses 4 passes with a 12 s settle for exactly this reason; do not
-shorten that sleep.
-
-### `ip link` says `state DOWN` — the adapter is fine
-
-`UP` in the flag list is the administrative state and it is set. `state DOWN`, `NO-CARRIER`
-and `DORMANT` only mean *not currently associated* — the normal idle condition, including
-while scanning. `ip link set … up` on an already-up interface returns 0 and changes nothing.
-To actually test the radio, make it do work:
-
-```bash
-nmcli -t -f SSID dev wifi list ifname wlx9cefd5f89420 --rescan yes | wc -l   # 40+ = healthy
-rfkill list                                                                 # both phys unblocked?
-```
-
-### `systemctl restart insta360` hangs
-
-Uvicorn's graceful shutdown waits for in-flight requests rather than cancelling them, and
-`/connect` can legitimately run ~48 s while the page polls `/status` twice a second. The
-unit passes `--timeout-graceful-shutdown 10` to cap it.
-
-### `/capture` → 502 "OSC network error during …"
-
-Raised only from `httpx.RequestError` — a network failure, never a camera rejection. The
-message names the phase (`takePicture`, `status poll`, `image download`).
-
-Captures are ~13 MB: under 2 s on a healthy link, but while the camera reboots latency goes
-from ~4 ms to over 1 s and the transfer overruns. The download retries 3× at a 90 s timeout;
-nothing recovers a camera that vanishes mid-transfer.
-
-```bash
-curl -s http://192.168.42.1/osc/info | python3 -m json.tool          # uptime, firmware
-curl -s -X POST http://192.168.42.1/osc/state | python3 -m json.tool # battery, card
-ping -c5 -I wlx9cefd5f89420 192.168.42.1                             # ~4ms, not ~1000ms
-```
-
-**A low `uptime` on a camera that has been connected a while means it rebooted.** An X5 that
-restarts repeatedly under sustained RTMP streaming is usually overheating; it presents as the
-AP vanishing and returning, and no host-side change fixes it.
-
-### Photo taken but no preview
+Each log keeps its own clock and some steps leave no trace, so `scripts/camera_recorder.py` records what
+base03 can observe of the camera's Wi-Fi. A failed connect or capture can then be timed afterwards from
+evidence. The recorder only reads and listens, runs as base3 without root, and sends nothing to wlp5s0
+or to the camera. `scripts/camera_timeline.py` turns one or more recordings into the connect, capture and
+disconnect sequences, and `--all` adds everything recorded.
 
 ```
-"POST /capture HTTP/1.1" 200 OK
-"GET /undefined HTTP/1.1" 404 Not Found
+python3 scripts/camera_recorder.py                  # until Ctrl-C
+python3 scripts/camera_recorder.py --seconds 600
+python3 scripts/camera_timeline.py logs/camera-recorder/<date>/recorder-<time>.jsonl
+python3 scripts/camera_timeline.py FILE --since HH:MM:SS --until HH:MM:SS --all
 ```
 
-The capture succeeded and the file is in `static/`; the front end read a key the response
-does not have, so `resultImage.src` became the string `undefined`. `/capture` returns
-`status`, `file_name`, `url` — the page must read `data.url`, and `/email` wants `filename`,
-not `image`. `tests/test_api_contract.py` fails if the two sides drift apart again.
-`index.html` is re-read per request, so front-end fixes need only a browser refresh.
+Each run writes one file under `logs/camera-recorder/<date>/`, with one JSON record per line. Every
+record carries the realtime, monotonic and boottime clocks, read together as it is written. The recorder
+polls fast and writes only the moments a sequence needs. Its sources are these:
 
-### Reading the logs
+- `iw event -T -f`, for scans with their channel lists, authentication, association, and disconnects
+  with their reason codes.
+- nl80211, read in process over a netlink socket. The camera adapter's station counters are polled five
+  times a second. They are written when the adapter joins or leaves, when no beacon arrives for 0.6 s and
+  when beacons resume, when a loss or failure counter rises, and every 10 s while joined. The scan cache
+  is read after every scan, join, disconnect, beacon loss and beacon stall.
+- `gdbus monitor` on NetworkManager, keeping the camera adapter, the camera's access point and the
+  connection, and on BlueZ.
+- `ip -ts monitor`, for the camera adapter's link, addresses and neighbours.
+- `journalctl -f`, for the app, the adapter helper, NetworkManager, wpa_supplicant, bluetoothd, the
+  kernel and sudo.
+- sock_diag, the kernel's socket-diagnostics netlink, for TCP sockets to the camera. It is read twice a
+  second while the adapter is joined and every 5 s otherwise. A socket is written when it opens, closes,
+  changes state, retransmits, or sends after 10 s idle. Closed connections waiting out TIME-WAIT are
+  left out, since the app's link check opens one every 3 s.
 
-```bash
-journalctl -u insta360 --since "30 min ago" | grep -v "GET /status"
-journalctl -u NetworkManager --since "30 min ago" | grep -iE "insta360|connection-delete|auto-activating"
-```
+It counts and drops wlp5s0's signal reports, which `iw` and wpa_supplicant each print every 3 s, along
+with neighbour and link changes on other interfaces and NetworkManager's reports about other devices. A
+password, PSK or ANKER_* value in any log line, sudo command lines included, is replaced with
+`[redacted]` before the line is written. The recorder reads only the camera adapter's scan cache, and
+each read makes the kernel drop entries not heard for 30 s, as that adapter's next scan would anyway.
 
-Filtering `/status` matters — the kiosk polls twice a second and drowns everything else.
-`connection-delete` names the PID that removed a profile, which is how GNOME Settings was
-caught.
+The timeline calls a scan the helper's when it is the first to start after a helper command, judged by
+the command's own journal stamp. Any other scan on the adapter is a background scan, shown only when its
+outcome changes.
 
-## Tests
+The timeline places each event by its own source's stamp. Those are the receipt times of `iw` and `ip`,
+journald's monotonic time, the kernel's association time, and the kernel's receive time for the camera's
+last frame. It also estimates when the camera's Wi-Fi started from the camera's TSF, the counter each
+beacon and probe response carries. The kernel keeps the TSF of the latest beacon and of the latest probe
+response, but one last-seen time for both, so either pairing can be wrong. In the recordings so far, the
+beacon pairing held within 1 ms while the adapter was joined, and the probe-response pairing held during
+scans. Each time, the other pairing sat 1.3 s off. The timeline therefore prints both candidates until two cache reads
+of different frames agree within 20 ms, and then reports that TSF zero as confirmed. In four recorded
+sessions it fell just before the camera was first heard, which is consistent with its Wi-Fi start but
+not proof. `iw ... scan dump` prints only the probe response's TSF, which was 48 s older than the latest
+beacon in one reading.
 
-`tests/conftest.py` stubs the robot SDK, so no camera or arm is needed:
+A 24-minute run spanning two station sessions used 0.45% of one core and wrote 986 KB. A 150 s run with
+the camera off used 0.26% of one core, over a third of it the start-up reads, and wrote 11 KiB. Each read of the kernel's TCP table walks its whole hash table and costs 2.5 to 3.8 ms here, which
+is why sockets are polled slowly while nothing is joined. wlp5s0 stayed associated through every
+recording, and its connected time rose by the full time between readings. One test fails if the recorder
+ever issues a command or netlink request that is not a read, and all of them run with
+`python3 -m unittest tests/test_camera_recorder.py`.
 
-```bash
-uv run --quiet --with pytest pytest -q
-```
+## Known failures
 
-The capture-retry tests import `main` and skip unless the app's dependencies are present;
-the contract and lease tests run anywhere.
+### "The camera isn't ready. Please try again in a minute, or ask for help."
+
+The station user sees this line when a connect fails. The reason and the hand action it needs go in the
+`detail` field of `/status` and in the log, and the dashboard's Insta360 panel shows that detail to the
+operator. A camera that does not answer the wake beacon needs its power button. A wake that brings the
+camera up without its Wi-Fi says so, and the fix is the camera's Wi-Fi switch. An adapter that a reset
+cannot bring back needs to be unplugged and plugged in again. Until the helper is installed, the detail
+names `sudo bash scripts/install-camera-helper.sh`. The whole wake path runs up to about two minutes,
+and the page says so while it waits.
+
+### "The camera Wi-Fi was busy. Please try again."
+
+A NetworkManager scan held the camera adapter for the helper's whole 30 s wait. It happens most in the
+three minutes after any disconnect, while NetworkManager scans back to back. Press Connect or Take
+Picture again, and each press starts a fresh wait. If it keeps happening, look for an open GNOME Settings
+Wi-Fi panel, the next entry.
+
+### Scan requests collide about twice a minute
+
+GNOME Settings' Wi-Fi panel, left open on base03's desktop, has both adapters scan every 15 to 30 s,
+wlp5s0 on level5_ included. With the panel open for an hour, the camera adapter's scan requests collided
+about twice a minute. With it closed, wlp5s0 went 100 s without a scan and no request collided. Close the
+panel when you are done with it.
+
+### NetworkManager's scans stop at channel 48 after a boot or an adapter reset
+
+After a boot, a driver reload or an adapter reset, NetworkManager's scans on the camera adapter end as
+aborted before they reach the upper 5 GHz channels. Ten such scans each ended after 10.4 to 11.7 s. The
+adapter's scan cache then held networks only up to 5240 MHz (channel 48), while level5_ transmits on
+5805 MHz and the kernel allows those channels.
+
+The cause is in wpa_supplicant 2.10, as Ubuntu's noble-updates tree builds it. `src/drivers/driver_nl80211_scan.c`
+gives each scan it requests a 10 s timeout and aborts the scan when that fires. The timeout rises to
+30 s once the kernel reports a finished scan on that interface, and `driver_nl80211_event.c` sets that
+flag only on new scan results. This adapter needs 21 to 22 s for all 39 channels, so every such scan is
+cut off and the timeout stays at 10 s. The helper's 9-channel kernel scans finish in about 7 s, and
+the first of them ends the loop. After the helper's first two scans following a boot, every later
+background scan ran all 39 channels and finished. With the helper installed nothing more is needed, and
+the app's fallback to NetworkManager rescans would share the limit.
+
+### The adapter hears nothing above channel 64
+
+The camera adapter can go deaf above channel 64, which hides a camera on channels 149 to 165. The scan
+timeout above fits it. One such episode survived a driver reload and ended as soon as a two-channel `iw`
+scan finished, and what started it is unknown. The helper's scans end it the same way, and
+`sudo /usr/local/libexec/selfie-camera-control scan` runs one by hand.
+
+### The camera shows "app disconnected" after a picture
+
+A capture stops the preview stream on port 6666 while it runs, and in the recorded run the stream stayed
+closed afterwards. That is likely the message the camera shows. It is expected, and Take Picture
+reconnects when the next picture needs it.
+
+### The camera's Wi-Fi is gone two minutes after a picture
+
+The camera turns its Wi-Fi off 2 minutes after its preview connection closes, and a capture closes it. A
+later Take Picture finds the camera silent and reconnects before its countdown. That took 26.5 s with the
+camera awake and 38.8 to 61.7 s once it had fallen asleep. Keeping the Wi-Fi up between sessions has not
+been tried.
+
+### A wake beacon brings nothing back
+
+A beacon sent while the camera is awake with its Wi-Fi timed out does nothing, as one sequence showed.
+The camera falls asleep about two minutes later, and a beacon then wakes it with its Wi-Fi. Switch the
+Wi-Fi on at the camera, or wait and press Connect again. The dependable fix would switch the Wi-Fi on
+remotely with the camera's open-Wi-Fi command (`PHONE_COMMAND_OPEN_CAMERA_WIFI`, code 33). The Insta360
+app sends that over the camera's Bluetooth control link, which this app has yet to implement.
+
+### "The camera woke over Bluetooth, but its Wi-Fi stayed off."
+
+The beacon woke the camera, and no scan heard its Wi-Fi before the connect gave up. In both connects on
+record the adapter most likely missed a camera that was on. One ran while the adapter was deaf above
+channel 64, and in the other NetworkManager's full scans heard the camera on channel 36 only after the
+connect had ended. A busy adapter ends the connect with the retry prompt, which closes that second path. Press Connect again. If the detail repeats, check the adapter with
+`/usr/local/libexec/selfie-camera-control check`, then switch the Wi-Fi on at the camera.
+
+### A capture fails while the camera is in video mode
+
+The camera refuses a picture in video mode, and the capture error carries its reply. The app leaves the
+camera's mode as it finds it, so switch the camera to photo mode at the camera and press Take Picture
+again.
+
+### "Arm needs a manual reset"
+
+The arm is off the selfie path with its TCP x below `arm.home_caution_x_mm`, or the app could not read
+its position or the controller's initial point. The message gives the measured x. Bring the arm home
+from the dashboard, where ARM HOME asks before a straight move and only Proceed with caution sends it, or
+move it by hand.
+
+### Take over fails because the app is stuck
+
+A stuck app refuses the dashboard's Take over. `sudo systemctl restart selfie` frees the arm, and the next
+connect needs no dialog.
+
+### The dashboard reports a failed connect after Take over
+
+An arm still moving out when the request arrives finishes that move before the retrace starts, so the
+handover can overrun the supervisor's 15 s wait. The dashboard then reports the failed connect with the
+robot's `[lease]` line. The app still finishes its retrace and releases the arm, so connecting again
+finds it free.
+
+## Known limitations
+
+This arrangement suits a supervised demonstration, and it would be risky in a real deployment. Anyone who
+can open the phone page can end an operator's session with one press, including in the middle of a pick.
+A dashboard-launched session that has not released after 15 s is sent SIGTERM and then SIGKILL, so
+nothing safes the arm first. The phone page and a dashboard can also take the arm from each other in
+turn, and every exchange costs a session restart, plus a retrace when the arm is out. A deployed station
+should be restructured so an operator approves each request. Another way is for the page to ask the SBot
+session to run its `selfie_pose` verb while the session keeps the lease. The handover has run only in
+tests against fakes, and its first live run should watch the retrace.
+
+Several cases still need a run on hardware. They are repeated connects to an awake camera, a repeated
+Connect while already ready, Disconnect during association, unplugging and replugging the camera adapter,
+and an unavailable SRT receiver. The longest sleep measured before a wake is about 3.5 h,
+and its Wi-Fi took 41 s of the 80 s the wake allows. A night's sleep is still unmeasured; the first
+Connect after one will show whether it fits, and the journal records it.

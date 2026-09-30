@@ -1,0 +1,277 @@
+#!/usr/bin/python3 -I
+"""Helper for the camera's own USB Wi-Fi adapter: check (any user), and reset, scan, sweep, isolate, boot (root)."""
+import fcntl
+import ipaddress
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import tomllib
+
+# Blank in the repo; scripts/install-camera-helper.sh writes this station's values into the installed copy.
+INTERFACE = ''
+USB_ID = ('0e8d', '7612')
+DRIVER = 'mt76x2u'
+# The camera's channels under region America: 36-48 and 149-165.
+CAMERA_FREQS = ('5180', '5200', '5220', '5240', '5745', '5765', '5785', '5805', '5825')
+CAMERA_SUBNET = ''
+ISOLATION_METRIC = '4000'
+SYS = Path('/sys')
+USB_NODES = Path('/dev/bus/usb')
+USBDEVFS_RESET = 0x5514
+ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'}
+READY_WAIT_S = 20
+BOOT_WAIT_S = 30
+# A NetworkManager sweep of this adapter runs 15-20 s; a scan waits that long for it.
+BUSY_WAIT_S = 30
+# Every scan request on the adapter, from the app, this helper or a test script, holds this lock.
+SCAN_LOCK = Path('/run/lock/selfie-camera-scan.lock')
+SCAN_LOCK_WAIT_S = 45
+NOT_ON_BUS = 'the adapter (USB 0e8d:7612) is not on the USB bus; unplug it and plug it back in'
+
+
+def run(args, timeout=10):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=ENV)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f'{args[0]} exited {result.returncode}')
+    return result.stdout
+
+
+def usb_device():
+    """The adapter's USB device directory, or None when it is not on the bus."""
+    for dev in sorted((SYS / 'bus/usb/devices').glob('*')):
+        try:
+            ids = ((dev / 'idVendor').read_text().strip(), (dev / 'idProduct').read_text().strip())
+        except OSError:
+            continue
+        if ids == USB_ID:
+            return dev
+    return None
+
+
+def problem():
+    """Why the adapter is not ready for the camera, or '' when it is."""
+    dev = usb_device()
+    if dev is None:
+        return NOT_ON_BUS
+    if (dev / 'authorized').read_text().strip() != '1':
+        return f'USB device {dev.name} is not authorized'
+    intf = dev / f'{dev.name}:1.0'
+    if not (intf / 'driver').exists() or (intf / 'driver').resolve().name != DRIVER:
+        return f'USB device {dev.name} is not bound to {DRIVER}'
+    if not (intf / 'net' / INTERFACE).exists():
+        return f'{DRIVER} did not create {INTERFACE}'
+    try:
+        state = run(['nmcli', '-g', 'GENERAL.STATE', 'device', 'show', INTERFACE], timeout=5).strip()
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        return f'NetworkManager cannot report {INTERFACE}: {exc}'
+    if state.split(' ', 1)[0] in ('0', '10', '20'):
+        return f'NetworkManager has {INTERFACE} {state}'
+    return ''
+
+
+def settled(test, seconds):
+    end = time.monotonic() + seconds
+    while not test():
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.5)
+    return True
+
+
+def wait_ready(seconds):
+    """'' once the adapter is ready within seconds, else the last reason it was not."""
+    why = problem()
+    end = time.monotonic() + seconds
+    while why and time.monotonic() < end:
+        time.sleep(1)
+        why = problem()
+    return why
+
+
+def port_reset(dev):
+    """USB port reset of the adapter alone, as usbreset does."""
+    node = USB_NODES / f"{int((dev / 'busnum').read_text()):03d}" / f"{int((dev / 'devnum').read_text()):03d}"
+    fd = os.open(node, os.O_WRONLY)
+    try:
+        fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+    finally:
+        os.close(fd)
+
+
+def reset():
+    """Re-authorize the adapter, reload its driver, port-reset it if that is not enough, and hand it to NetworkManager."""
+    dev = usb_device()
+    if dev is None:
+        raise RuntimeError(NOT_ON_BUS)
+    if (dev / 'authorized').read_text().strip() != '1':
+        (dev / 'authorized').write_text('1')
+    if (SYS / 'module' / DRIVER).exists():
+        run(['modprobe', '-r', DRIVER], timeout=30)
+    run(['modprobe', DRIVER], timeout=30)
+    present = lambda: (SYS / 'class/net' / INTERFACE).exists()
+    if not settled(present, 10):
+        port_reset(dev)
+    if settled(present, 10):
+        run(['nmcli', 'device', 'set', INTERFACE, 'managed', 'yes'], timeout=10)
+    why = wait_ready(READY_WAIT_S)
+    if why:
+        raise RuntimeError(f'still not ready after a reset: {why}')
+    print('ready')
+
+
+def networks(text):
+    """One dict per network in iw's scan output: bssid, freq (MHz), ssid, ago (ms since heard)."""
+    found, bss = [], None
+    for line in text.splitlines():
+        if line.startswith('BSS '):
+            bss = {'bssid': line[4:21].upper(), 'freq': '', 'ssid': '', 'ago': None}
+            found.append(bss)
+            continue
+        field = line.strip()
+        if bss is None:
+            continue
+        if field.startswith('freq:'):
+            bss['freq'] = field.split()[1].split('.')[0]
+        elif field.startswith('SSID:') and not bss['ssid']:
+            bss['ssid'] = field[5:].strip()
+        elif field.startswith('last seen:') and field.endswith(' ms ago'):
+            bss['ago'] = int(field.split()[2])
+    return found
+
+
+class ScanLock:
+    """Exclusive hold on SCAN_LOCK; opens without O_CREAT first, since fs.protected_regular refuses it on another user's file."""
+
+    def __enter__(self):
+        try:
+            self.fd = os.open(SCAN_LOCK, os.O_RDONLY)
+        except FileNotFoundError:
+            self.fd = os.open(SCAN_LOCK, os.O_RDONLY | os.O_CREAT, 0o644)
+        end = time.monotonic() + SCAN_LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= end:
+                    os.close(self.fd)
+                    raise RuntimeError(f'another scan held {SCAN_LOCK} for {SCAN_LOCK_WAIT_S} s')
+                time.sleep(0.2)
+
+    def __exit__(self, *_):
+        os.close(self.fd)
+
+
+def scan():
+    """Clear any supplicant scan restriction, kernel-scan the camera's channels, print each network heard in it."""
+    with ScanLock():
+        _scan(['freq', *CAMERA_FREQS])
+
+
+def sweep():
+    """The same scan over every channel the adapter can use."""
+    with ScanLock():
+        _scan([])
+
+
+def _scan(channels):
+    try:
+        said = run(['wpa_cli', '-i', INTERFACE, 'set', 'freq_list', ''], timeout=5).strip()
+        if said.splitlines()[-1:] != ['OK']:
+            print(f'wpa_supplicant did not clear the scan restriction: {said}', file=sys.stderr)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        print(f'wpa_supplicant did not clear the scan restriction: {exc}', file=sys.stderr)
+    start = time.monotonic()
+    while True:
+        result = subprocess.run(['iw', 'dev', INTERFACE, 'scan', *channels],
+                                capture_output=True, text=True, timeout=60, env=ENV)
+        if result.returncode == 0:
+            break
+        if '(-16)' not in result.stderr:
+            raise RuntimeError(result.stderr.strip() or f'iw scan exited {result.returncode}')
+        if time.monotonic() - start >= BUSY_WAIT_S:
+            raise RuntimeError(f'the adapter stayed busy with another scan for {BUSY_WAIT_S} s')
+        time.sleep(1)
+    since_ms = (time.monotonic() - start) * 1000
+    for bss in networks(result.stdout):
+        if bss['ago'] is not None and bss['ago'] <= since_ms:
+            print(f"{bss['bssid']}\t{bss['freq']}\t{bss['ssid']}")
+
+
+def isolate():
+    """Make the camera's subnet unreachable by any route but its adapter's own, which outranks this one while it is up."""
+    run(['ip', 'route', 'replace', 'unreachable', CAMERA_SUBNET, 'metric', ISOLATION_METRIC], timeout=5)
+    print(f'{CAMERA_SUBNET} is unreachable except through {INTERFACE}', flush=True)
+
+
+def boot():
+    """At boot: isolate the camera's subnet, wait for the adapter, and reset it up to twice when it came up broken."""
+    try:
+        isolate()
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        print(f'could not isolate {CAMERA_SUBNET}: {exc}', flush=True)
+    why = wait_ready(BOOT_WAIT_S)
+    for attempt in (1, 2):
+        if not why:
+            break
+        print(f'adapter not ready: {why}; reset {attempt} of 2', flush=True)
+        try:
+            reset()
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            print(f'reset {attempt} failed: {exc}', flush=True)
+        why = problem()
+    if why:
+        raise RuntimeError(f'adapter still not ready after two resets: {why}; unplug it and plug it back in')
+    print('adapter ready')
+
+
+def configure(station_file):
+    """This helper's source with INTERFACE and CAMERA_SUBNET set from station.toml's [camera]; the adapter must be plugged in."""
+    camera = tomllib.loads(Path(station_file).read_text()).get('camera', {})
+    iface, ip = str(camera.get('wifi_interface', '')), str(camera.get('ip', ''))
+    dev = usb_device()
+    net = dev / f'{dev.name}:1.0' / 'net' if dev else None
+    made = {p.name for p in net.iterdir()} if net and net.is_dir() else set()
+    if iface not in made:
+        raise RuntimeError(f"{station_file}: wifi_interface {iface!r} is not the camera adapter's (USB 0e8d:7612 "
+                           f"made {', '.join(sorted(made)) or 'nothing'}); plug the adapter in and name its interface")
+    try:
+        subnet = ipaddress.ip_network(f'{ipaddress.IPv4Address(ip)}/24', strict=False)
+    except ValueError:
+        raise RuntimeError(f'{station_file}: ip {ip!r} is not an IPv4 address')
+    source = Path(__file__).read_text()
+    for name, value in (('INTERFACE', iface), ('CAMERA_SUBNET', str(subnet))):
+        source, count = re.subn(rf"^{name} = ''$", f'{name} = {value!r}', source, flags=re.M)
+        if count != 1:
+            raise RuntimeError(f'{__file__} has no blank {name} line to set')
+    return source
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == 'configure':
+        sys.stdout.write(configure(sys.argv[2]))
+        return 0
+    command = sys.argv[1] if len(sys.argv) == 2 else ''
+    if not (INTERFACE and CAMERA_SUBNET):
+        raise RuntimeError('this copy names no adapter; install it with: sudo bash scripts/install-camera-helper.sh')
+    if command == 'check':
+        why = problem()
+        print(why or 'ready')
+        return 1 if why else 0
+    if command not in ('reset', 'scan', 'sweep', 'isolate', 'boot'):
+        raise RuntimeError('Usage: selfie-camera-control check|reset|scan|sweep|isolate|boot, or configure STATION_TOML')
+    if os.geteuid() != 0:
+        raise RuntimeError(f'{command} needs root; run it through the installed sudo rule')
+    {'reset': reset, 'scan': scan, 'sweep': sweep, 'isolate': isolate, 'boot': boot}[command]()
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)

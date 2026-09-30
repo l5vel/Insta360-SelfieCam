@@ -1,0 +1,35 @@
+[project]
+name = "selfie"
+version = "0.1.0"
+description = "Insta360 X5 selfie station on the robot arm, run from a phone page"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "arm-base-control[sparkflex]",
+    "av>=18.1.0",
+    "fastapi>=0.141.1",
+    "insta360>=0.1.21",
+    "numpy>=1.26.4",
+    "opencv-python>=4.11.0.86",
+    "requests>=2.34.2",
+    "uvicorn>=0.53.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+arm-base-control = { path = "third_party/ArmBaseControl", editable = true }
+
+# Copied verbatim from ArmBaseControl docs/BATTERY.md; uv reads it from the root project only.
+[[tool.uv.dependency-metadata]]
+name = "anker-solix-api"
+version = "3.8.1"
+requires-python = ">=3.11"
+requires-dist = [
+    "aiohttp>=3.14.3",
+    "aiofiles>=25.1.0",
+    "cryptography>=50.0.0",
+    "paho-mqtt>=2.1.0",
+    "python-dotenv>=1.2.1",
+]

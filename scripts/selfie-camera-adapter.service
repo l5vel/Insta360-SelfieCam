@@ -1,0 +1,12 @@
+[Unit]
+Description=Selfie camera USB Wi-Fi adapter check, with a reset when it came up broken
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=exec
+ExecStart=/usr/local/libexec/selfie-camera-control boot
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

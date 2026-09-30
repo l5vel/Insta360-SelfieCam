@@ -1,208 +1,314 @@
-"""xArm control for the Selfie Station.
+"""xArm motion for the selfie station.
 
-Importing this module loads the xArm SDK but does NOT connect to the robot —
-the connection is opened lazily on the first move call (get_arm), so the
-FastAPI app still starts if the arm is offline.
-
-Motion model:
-- The "are we there yet?" check (`arm_at_pose`) is a *pure read* of the live
-  joint angles via api_get_servo_angle. It never commands motion.
-- Trajectory following (`arm_follow`) issues one blocking api_set_servo_angle
-  per waypoint, so every intermediate pose is honored — it is never a single
-  direct move to the goal pose.
-- Homing is gated (`_arm_deployed`): `move_arm_home` only commands motion if
-  `move_arm_to_selfie` armed the gate this session. A stray or automatic
-  /disconnect on an arm that was never deployed is a no-op, so the arm is
-  never driven into motion uncommanded.
+The handler is constructed on first use. Importing this module never connects to
+the robot, so the camera service can start while the arm is unavailable.
 """
 
-import sys
-import time
-import threading
-
-# --- ARM CONFIGURATION ---
+import logging
+import math
 import os
-SBOT_PATH = "/home/base3/sbot_classical" if os.path.exists("/home/base3/sbot_classical") else "/home/l5vel-sbot/SBot/third_party/sbot_classical"
-ARM_IP = "172.16.0.13"
+import threading
+import time
+from contextlib import contextmanager
 
-# path_setup registers arm_base_control on sys.path as an import side effect.
-if SBOT_PATH not in sys.path:
-    sys.path.insert(0, SBOT_PATH)
-import path_setup  # noqa: E402,F401
-from arm_base_control.arm import XArmHandler  # noqa: E402
+from arm_base_control import load_config
+from arm_base_control.arm import XArmHandler, selfie_path
+from arm_base_control.resource_lease import (
+    default_lease,
+    confirm_or_takeover,
+    TAKEOVER,
+)
 
-# Joint-angle trajectory (degrees) from home -> selfie pose.
-# Index 0 is home; the last entry is the desired selfie position.
-ARM_TRAJECTORY = [
-    [0, 38.1, -6.7, 2, 43.3, -1.3],
-    [0, 43, -30, 0, -1.5, 0],
-    [0, 8, -120, 0, -56, 0],
-    [-179, 8, -120, 0, -40, 0],
-    [-179, 72.4, -27.8, 40.7, 24.4, -50.9],
-]
-ARM_HOME_POSE = ARM_TRAJECTORY[0]
-ARM_SELFIE_POSE = ARM_TRAJECTORY[-1]
-ARM_POSE_TOL_DEG = 2.5
-ARM_SPEED = 25
-ARM_MVACC = 25
-ARM_SETTLE_SEC = 2  # pause after a move so the arm stabilizes before capture
+class SelfieArmHandler(XArmHandler):
+    """Keep the station's explicit trajectory in charge of recovery motion."""
+
+    def start_error_monitor(self):
+        # The upstream monitor can reset or home the arm on a fault. A station
+        # operator must decide when to retry after a failed waypoint instead.
+        pass
+
+
+ARM_IP = os.environ.get("SELFIE_ARM_IP", "172.16.0.13")
+# The robot config's arm.selfie block, which SBot's selfie_pose verb follows too.
+_ARM_CFG = load_config().arm
+_SELFIE = getattr(_ARM_CFG, "selfie", None)
+ARM_TRAJECTORY = [[float(a) for a in wp] for wp in _SELFIE.path] if _SELFIE else []
+ARM_HOME_POSE = ARM_TRAJECTORY[0] if ARM_TRAJECTORY else None
+ARM_SELFIE_POSE = ARM_TRAJECTORY[-1] if ARM_TRAJECTORY else None
+ARM_POSE_TOL_DEG = float(getattr(_SELFIE, "tolerance_deg", 0))
+ARM_SPEED = float(getattr(_SELFIE, "speed", 0))
+ARM_MVACC = float(getattr(_SELFIE, "mvacc", 0))
+ARM_MOVE_TIMEOUT_SEC = 30
+ARM_SETTLE_SEC = 0.5
+LOG = logging.getLogger("uvicorn.error.arm")
 
 _arm_handler = None
-_arm_lock = threading.RLock()  # serialize arm access across requests
-
-# Safety gate: True only after the arm has been explicitly commanded to the
-# selfie pose this session. `move_arm_home` refuses to move unless this is set,
-# so a stray/automatic /disconnect can never drive an undeployed arm.
+_arm_lock = threading.RLock()
 _arm_deployed = False
+_last_waypoint_index = None
+_takeover_watched = False
 
 
-def get_arm():
-    """Lazily connect to the xArm; cached for the process lifetime."""
+class ArmLeaseConflict(RuntimeError):
+    """Another ArmBaseControl process currently owns the arm lease."""
+
+    def __init__(self, name, pid, mode, task):
+        super().__init__(f"Arm is currently controlled by {name} (pid {pid}).")
+        self.owner = {"name": name, "pid": pid, "mode": mode, "task": task}
+
+
+class ArmNotPosed(RuntimeError):
+    """The arm must be at the selfie pose before a capture."""
+
+
+def get_arm(takeover=False):
+    """Connect once, only when arm access is requested."""
     global _arm_handler
     with _arm_lock:
         if _arm_handler is None:
-            _arm_handler = XArmHandler(
-                robot_ip=ARM_IP, gripper=None, dynamic_recovery_enabled=True
+            lease = default_lease()
+            pid, name, mode, task = lease.who()
+
+            if pid is None:
+                decision = TAKEOVER
+            else:
+                print(f"Robot is held by {name} (pid {pid}, mode={mode}, task={task})")
+                if not takeover:
+                    raise ArmLeaseConflict(name, pid, mode, task)
+                decision = confirm_or_takeover(mode="my-project", assume_yes=True, lease=lease)
+
+            if decision != TAKEOVER:
+                raise ArmLeaseConflict(name, pid, mode, task)
+            # Safe to connect / construct the robot handler now.
+            _arm_handler = SelfieArmHandler(
+                robot_ip=ARM_IP, gripper=None, dynamic_recovery_enabled=False, lease_mode="selfie"
             )
-    return _arm_handler
+            _watch_takeover(lease)
+        return _arm_handler
 
 
-def _release_for_takeover():
-    """Off-loop: another launcher wants the arm. Drop it so the lease frees cooperatively."""
-    def _run():
-        with _arm_lock:
-            try:
-                arm_release()   # deliberately NOT move_arm_home: the taker adopts the pose
-            except Exception as e:
-                print(f"[selfie] releasing the arm for a takeover failed: {e}")
-    threading.Thread(target=_run, daemon=True).start()
+def _watch_takeover(lease):
+    """Hand the arm over when another launcher asks for it; registered once, the lease re-arms it per acquire."""
+    global _takeover_watched
+    if not _takeover_watched:
+        lease.on_takeover(_on_takeover)
+        _takeover_watched = True
 
 
-def _register_takeover_hook():
-    """Answer ABC's cooperative takeover wait instead of waiting to be SIGKILLed."""
-    try:
-        from arm_base_control.resource_lease import default_lease
-        default_lease().on_takeover(_release_for_takeover)
-    except Exception as e:
-        print(f"[selfie] takeover hook unavailable: {e}")
+def _on_takeover():
+    """Fired on the lease's heartbeat thread, so it only starts the handover."""
+    threading.Thread(target=hand_over, name="selfie-handover", daemon=True).start()
 
 
-_register_takeover_hook()
-
-
-def arm_current_angles():
-    """Read the live first-6 joint angles, or None if unavailable."""
-    code, angles = get_arm().api_get_servo_angle(is_radian=False)
-    if code != 0 or angles is None:
-        return None
-    return list(angles[:6])
-
-
-def arm_at_pose(target, tol=ARM_POSE_TOL_DEG):
-    """True only if every joint is within tol of target. Pure read — no motion."""
-    angles = arm_current_angles()
-    if angles is None:
-        return False
-    return all(abs(a - t) <= tol for a, t in zip(angles, target))
-
-
-def arm_ready():
-    """Clear faults and put the arm in position-control ready state."""
-    arm = get_arm()
-    arm.arm.clean_error()
-    arm.arm.clean_warn()
-    time.sleep(0.5)
-    arm.arm.motion_enable(True)
-    arm.api_set_mode(6)   # position control
-    arm.api_set_state(0)  # ready
-    time.sleep(0.2)
-
-
-def arm_follow(waypoints):
-    """Step through joint-angle waypoints one blocking move at a time so every
-    intermediate pose is honored (never a single direct move to the goal)."""
-    arm = get_arm()
-    for i, wp in enumerate(waypoints):
-        code = arm.api_set_servo_angle(
-            angle=list(wp), speed=ARM_SPEED, mvacc=ARM_MVACC, wait=True
-        )
-        if code != 0:
-            raise Exception(f"Arm move to waypoint {i + 1}/{len(waypoints)} failed (code {code}).")
-
-
-def move_arm_to_selfie():
-    """Drive the arm to the selfie pose along the forward trajectory, unless a
-    fresh joint read shows it is already there.
-
-    This is the explicit deploy command; it arms the gate (`_arm_deployed`) so
-    the arm may later be sent home. The flag is set before motion so that a
-    partially-completed trajectory can still be reversed by `move_arm_home`.
-
-    Only when the arm actually travels the trajectory does it then wait
-    `ARM_SETTLE_SEC` to stabilize before returning, so the capture isn't
-    blurred. If it's already at the selfie pose, it returns immediately with no
-    wait.
-    """
-    global _arm_deployed
-    with _arm_lock:
-        _arm_deployed = True  # commanded away from home -> homing is now allowed
-        if arm_at_pose(ARM_SELFIE_POSE):
-            return
-        arm_ready()
-        arm_follow(ARM_TRAJECTORY)
-        # First arrival only: let the arm settle before the photo is taken.
-        # (Skipped when already at pose via the early return above.)
-        time.sleep(ARM_SETTLE_SEC)
-
-
-def arm_release():
-    """Reset the arm, hand back mode-1 control, and release the arm/base lease.
-
-    Clears any faults/warnings first (reset), then drops the arm into mode 1 —
-    the xArm servo-motion mode that gives up position-control ownership and
-    allows the arm to be freely repositioned by hand or by an external
-    controller. Call this only after the arm is safely parked at home.
-
-    No-op if we never connected to the arm this session, so a disconnect with no
-    prior arm activity won't open a connection just to release it.
-
-    Also disconnects the handler. XArmHandler.disconnect() is the only path that calls
-    ResourceLease.release(), so without it this process holds /dev/shm/sbot.lease for its
-    whole lifetime and every teleop takeover ends in a SIGKILL and a systemd restart.
-    """
-    global _arm_deployed, _arm_handler
+def hand_over():
+    """Give the arm to a launcher that asked for it: home it along the selfie path when it is out, then let go."""
+    global _arm_handler, _arm_deployed, _last_waypoint_index
     with _arm_lock:
         if _arm_handler is None:
             return
-        arm = _arm_handler
-        arm.arm.clean_error()
-        arm.arm.clean_warn()
-        time.sleep(0.3)
-        arm.api_set_mode(1)   # servo motion mode -> hand off control
-        arm.api_set_state(0)  # apply the mode
-        _arm_deployed = False
+        LOG.warning("another program asked for the arm; returning it along the selfie path and releasing it")
         try:
-            arm.disconnect()      # the only route that releases the arm/base lease
-        except Exception as e:
-            print(f"[selfie] arm disconnect failed: {e}")
-        _arm_handler = None       # next get_arm() reconnects and re-acquires
+            move_arm_home()
+        except Exception as exc:
+            LOG.error("could not return the arm home (%s); releasing it where it stands", exc)
+        try:
+            _arm_handler.disconnect()  # releases the ArmBaseControl ownership lease
+        finally:
+            _arm_handler = None
+            _arm_deployed = False
+            _last_waypoint_index = None
+
+
+def arm_current_angles(takeover=False):
+    """Return six measured joint angles, or None when the read is invalid."""
+    code, angles = get_arm(takeover=takeover).api_get_servo_angle(is_radian=False, is_real=True)
+    if code != 0 or angles is None or len(angles) < 6:
+        return None
+    measured = list(angles[:6])
+    if not all(math.isfinite(a) for a in measured):
+        return None
+    return measured
+
+
+def _matches_pose(angles, target, tol=ARM_POSE_TOL_DEG):
+    if len(target) != 6:
+        raise ValueError("An arm pose must contain six joint angles")
+    return angles is not None and all(
+        abs(actual - desired) <= tol for actual, desired in zip(angles, target)
+    )
+
+
+def arm_at_pose(target, tol=ARM_POSE_TOL_DEG):
+    """Check the measured pose without issuing a motion command."""
+    return _matches_pose(arm_current_angles(), target, tol)
+
+
+def _check_code(action, code):
+    if code != 0:
+        raise RuntimeError(f"Arm {action} failed (code {code})")
+
+
+def _initial_point(takeover=False):
+    """The controller's own initial point [J1..J6 deg], or None when it cannot be read."""
+    code, angles = get_arm(takeover=takeover).get_initial_point()
+    if code != 0 or angles is None or len(angles) < 6:
+        return None
+    point = [float(a) for a in angles[:6]]
+    return point if all(math.isfinite(a) for a in point) else None
+
+
+def _move_verified(name, target, takeover=False):
+    _check_code(
+        f"move to {name}",
+        get_arm(takeover=takeover).api_set_servo_angle(
+            angle=list(target), speed=ARM_SPEED, mvacc=ARM_MVACC,
+            wait=True, timeout=ARM_MOVE_TIMEOUT_SEC,
+        ),
+    )
+    if not _matches_pose(arm_current_angles(takeover=takeover), target):
+        raise RuntimeError(f"Arm did not reach {name}")
+
+
+def _recover_home(angles, takeover=False):
+    """Bring an arm that is off the path home through the controller's initial point; refuse behind the camera line."""
+    initial = _initial_point(takeover=takeover)
+    if initial is None:
+        raise RuntimeError("Arm is off the selfie path and its controller's initial point cannot be read; "
+                           "manual recovery required")
+    at_initial = _matches_pose(angles, initial)
+    if not at_initial:
+        behind = selfie_path.behind_line(get_arm(takeover=takeover), _ARM_CFG)
+        if behind:
+            line = float(getattr(_ARM_CFG, "home_caution_x_mm", 0))
+            raise RuntimeError(f"Arm needs a manual reset: {behind}, and below {line:g} mm the station does not "
+                               f"move it on its own")
+    arm_ready(takeover=takeover)
+    if not at_initial:
+        LOG.warning("arm is off the selfie path, clear of the camera line; moving it to the controller's "
+                    "initial point %s", [round(a, 1) for a in initial])
+        _move_verified("the initial point", initial, takeover=takeover)
+    LOG.warning("arm is at the controller's initial point; moving it to the selfie path's home %s", ARM_HOME_POSE)
+    _move_verified("the home pose", ARM_HOME_POSE, takeover=takeover)
+
+
+def arm_ready(takeover=False):
+    """Enter position mode for blocking joint moves."""
+    arm = get_arm(takeover=takeover)
+    _check_code("clear error", arm.arm.clean_error())
+    _check_code("clear warning", arm.arm.clean_warn())
+    time.sleep(0.5)
+    _check_code("enable motion", arm.motion_enable(True))
+    _check_code("set position mode", arm.api_set_mode(0))
+    _check_code("set ready state", arm.api_set_state(0))
+    time.sleep(0.2)
+
+
+def _follow_indices(indices, takeover=False):
+    global _last_waypoint_index
+    arm = get_arm(takeover=takeover)
+    for index in indices:
+        _check_code(
+            f"move to waypoint {index + 1}/{len(ARM_TRAJECTORY)}",
+            arm.api_set_servo_angle(
+                angle=list(ARM_TRAJECTORY[index]), speed=ARM_SPEED,
+                mvacc=ARM_MVACC, wait=True, timeout=ARM_MOVE_TIMEOUT_SEC,
+            ),
+        )
+        _last_waypoint_index = index
+
+
+def move_arm_to_selfie(takeover=False):
+    """Deploy from the home pose through every intermediate waypoint."""
+    global _arm_deployed, _last_waypoint_index
+    with _arm_lock:
+        if not ARM_TRAJECTORY:
+            raise RuntimeError("This robot's config has no arm.selfie path")
+        angles = arm_current_angles(takeover=takeover)
+        if angles is None:
+            raise RuntimeError("Cannot read arm pose before deployment")
+        if _matches_pose(angles, ARM_SELFIE_POSE):
+            _arm_deployed = True
+            _last_waypoint_index = len(ARM_TRAJECTORY) - 1
+            return
+        if not _matches_pose(angles, ARM_HOME_POSE):
+            if _arm_deployed and selfie_path.waypoint(angles, ARM_TRAJECTORY, ARM_POSE_TOL_DEG) is not None:
+                raise RuntimeError("Arm deployment is incomplete; return it home first")
+            _recover_home(angles, takeover=takeover)
+        _last_waypoint_index = 0
+        _arm_deployed = True  # permit recovery if a later waypoint fails
+        arm_ready(takeover=takeover)
+        _follow_indices(range(1, len(ARM_TRAJECTORY)), takeover=takeover)
+        time.sleep(ARM_SETTLE_SEC)
+
+
+@contextmanager
+def selfie_pose_guard():
+    """Keep the arm at its measured selfie pose throughout the shutter; another process holding the arm keeps its own."""
+    with _arm_lock:
+        if _arm_handler is None and default_lease().who()[0] is not None:
+            yield
+            return
+        if (_arm_handler is None or not _arm_deployed
+                or not _matches_pose(arm_current_angles(), ARM_SELFIE_POSE)):
+            raise ArmNotPosed("Pose the arm before taking a picture.")
+        yield
 
 
 def move_arm_home():
-    """Return to home along the reversed trajectory, unless already home.
-
-    Gated: refuses to command any motion unless the arm was deployed to the
-    selfie pose this session (`_arm_deployed`). This makes a stray or automatic
-    /disconnect on an undeployed arm a guaranteed no-op — the arm never moves
-    unless it was explicitly commanded out in the first place.
-    """
-    global _arm_deployed
+    """Retrace the trajectory from a verified waypoint reached this session."""
+    global _arm_deployed, _last_waypoint_index
     with _arm_lock:
         if not _arm_deployed:
-            return
-        if arm_at_pose(ARM_HOME_POSE):
+            return False
+        angles = arm_current_angles()
+        if angles is None:
+            raise RuntimeError("Cannot read arm pose for safe return home")
+        if _matches_pose(angles, ARM_HOME_POSE):
             _arm_deployed = False
-            return
+            _last_waypoint_index = 0
+            return True
+        # A failed move may have reached its target despite a nonzero status.
+        highest = min((_last_waypoint_index or 0) + 1, len(ARM_TRAJECTORY) - 1)
+        start = next(
+            (i for i in range(highest, 0, -1)
+             if _matches_pose(angles, ARM_TRAJECTORY[i])),
+            None,
+        )
+        if start is None:
+            _recover_home(angles)
+            _arm_deployed = False
+            _last_waypoint_index = 0
+            return True
         arm_ready()
-        arm_follow(list(reversed(ARM_TRAJECTORY)))
+        _follow_indices(range(start - 1, -1, -1))
+        if not arm_at_pose(ARM_HOME_POSE):
+            raise RuntimeError("Arm did not reach the home pose")
         _arm_deployed = False
+        return True
+
+
+def deployed():
+    """Whether this app has the arm out along its selfie path."""
+    return _arm_deployed
+
+
+def arm_release():
+    """Switch a parked arm to teaching mode and release its connection."""
+    global _arm_handler, _arm_deployed, _last_waypoint_index
+    with _arm_lock:
+        if _arm_handler is None:
+            return
+        if not arm_at_pose(ARM_HOME_POSE):
+            raise RuntimeError("Arm must be at home before manual release")
+        arm = _arm_handler
+        _check_code("clear error", arm.arm.clean_error())
+        _check_code("clear warning", arm.arm.clean_warn())
+        time.sleep(0.3)
+        _check_code("set joint teaching mode", arm.api_set_mode(2))
+        _check_code("set ready state", arm.api_set_state(0))
+        try:
+            arm.disconnect()  # releases the ArmBaseControl ownership lease
+        finally:
+            _arm_handler = None
+        _arm_deployed = False
+        _last_waypoint_index = None
